@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/anilonayy/circuit-breaker/options"
+	"github.com/anilonayy/circuitbreaker/options"
 	"github.com/stretchr/testify/assert"
 )
 

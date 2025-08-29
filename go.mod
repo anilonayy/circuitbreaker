@@ -1,4 +1,4 @@
-module github.com/anilonayy/circuit-breaker
+module github.com/anilonayy/circuitbreaker
 
 go 1.25.0
 

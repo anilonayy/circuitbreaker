@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/anilonayy/circuit-breaker/options"
+	"github.com/anilonayy/circuitbreaker/options"
 )
 
 // State represents the current state of the Circuit Breaker.
