@@ -28,7 +28,7 @@ go.work.sum
 # env file
 .env
 
-vendor/*
+vendor/
 
 # Editor/IDE
 # .idea/
