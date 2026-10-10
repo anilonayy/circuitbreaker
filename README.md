@@ -1,7 +1,7 @@
 # 🚦 Go Circuit Breaker
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/anilonayy/circuitbreaker.svg)](https://pkg.go.dev/github.com/anilonayy/circuitbreaker)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Production‑ready, lightweight Circuit Breaker for Go. Protects your external calls (HTTP, DB, RPC) by monitoring failures in a sliding time window, opening on sustained errors, and probing recovery in half‑open before safely closing.
 
@@ -30,14 +30,14 @@ import (
 )
 
 func main() {
-    cb := circuitbreaker.NewCircuitBreaker(
-        "payment-service",
-        // Start with a preset, then customize if needed
-        options.WithHTTPDefaults()...,              // sensible HTTP defaults
+    // Start with a preset, then customize if needed
+    opts := options.WithHTTPDefaults()
+    opts = append(opts,
         options.WithFailureRateThreshold(0.5),      // open if 50%+ failures
         options.WithOpenTimeout(30*time.Second),    // stay open 30s
         options.WithRequestTimeout(5*time.Second),  // per-call timeout
     )
+    cb := circuitbreaker.NewCircuitBreaker("payment-service", opts...)
 
     ctx := context.Background()
     err := cb.Execute(ctx, func(ctx context.Context) error {
@@ -63,13 +63,11 @@ func main() {
 
 - [x] MVP
 - [ ] Add different framework examples (echo, gin etc..)
-- [ ] Add test coverage
+- [x] Unit tests (`circuitbreaker_test.go`)
 - [ ] Add benchmarks
 - [ ] Add documentation
 - [ ] Add regression tests
 
-
-Use `ExecuteWithTimeout` to let the breaker coordinate goroutine completion around its timeout.
 
 ---
 
@@ -103,6 +101,8 @@ stateDiagram-v2
 ---
 
 ## 🧩 Defaults
+
+Values used by `NewCircuitBreaker` when no options are passed. Note that the presets differ (for example `WithDefaults()` sets the minimum request threshold to 100); see `options/options.go`.
 
 | Setting | Default |
 | --- | --- |
@@ -159,14 +159,13 @@ cb := circuitbreaker.NewCircuitBreaker("svc", opts...)
 ### HTTP call with custom failure predicate
 
 ```go
-cb := circuitbreaker.NewCircuitBreaker(
-    "http-upstream",
-    options.WithHTTPDefaults()...,
+opts := append(options.WithHTTPDefaults(),
     options.WithCustomErrorPredicate(func(err error) bool {
         // Only treat real transport/timeouts as failures; app 4xx may not be
         return err != nil
     }),
 )
+cb := circuitbreaker.NewCircuitBreaker("http-upstream", opts...)
 
 err := cb.Execute(context.Background(), func(ctx context.Context) error {
     // net/http client call that respects ctx
@@ -221,11 +220,13 @@ circuitbreaker.RemoveCircuitBreaker("billing")
 
 - Thread‑safe: internal locking protects state and metrics.
 - Context‑aware: honors provided `context.Context` and enforces its own timeout.
+- `NewCircuitBreaker(key, ...)` registers the breaker under `key`; calling it again with an existing key returns the already-registered breaker and ignores the new options.
+- `ExecuteWithTimeout` is an alternative to `Execute` that coordinates goroutine completion around the breaker's timeout.
 - Stringer: `cb.String()` prints a compact summary for logs.
 
 ---
 
 ## License
 
-Apache‑2.0 — see `LICENSE`.
+MIT — see `LICENSE`.
 
