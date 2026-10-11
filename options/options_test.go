@@ -7,6 +7,7 @@ import (
 	"math"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -807,8 +808,8 @@ func (l *transitions) snapshot() []string {
 }
 
 // WithStateChangeListener takes any, because the options package cannot name
-// the breaker's State type. The breaker accepts exactly func(from, to State)
-// and silently ignores everything else.
+// the breaker's State type. The breaker accepts a func(from, to State), also as
+// a defined type, and panics on a value of any other type.
 func TestStateChangeListenerOnBreaker(t *testing.T) {
 	trip := func(t *testing.T, opts ...options.Option) {
 		t.Helper()
@@ -835,27 +836,61 @@ func TestStateChangeListenerOnBreaker(t *testing.T) {
 		})
 	})
 
-	t.Run("a value of another type is ignored and keeps the earlier listener", func(t *testing.T) {
+	t.Run("a defined func type with the same signature is called", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			var log transitions
 
 			type namedListener func(from, to circuitbreaker.State)
 
-			trip(t,
-				options.WithStateChangeListener(log.record),
-				options.WithStateChangeListener(func(from, to string) { t.Error("listener with string parameters was called") }),
-				options.WithStateChangeListener(func(to circuitbreaker.State) { t.Error("one-argument listener was called") }),
-				// Even a defined type with the right underlying signature.
-				options.WithStateChangeListener(namedListener(func(_, _ circuitbreaker.State) {
-					t.Error("listener of a defined func type was called")
-				})),
-				options.WithStateChangeListener("not a func"),
-			)
+			trip(t, options.WithStateChangeListener(namedListener(log.record)))
 
 			if got := log.snapshot(); !slices.Equal(got, want) {
 				t.Errorf("transitions = %v, want %v", got, want)
 			}
 		})
+	})
+
+	// Regression: a listener of the wrong type used to be dropped without a
+	// word, so a breaker ran without the listener its owner thought it had.
+	t.Run("a value of another type panics", func(t *testing.T) {
+		wrong := map[string]any{
+			"string parameters": func(from, to string) {},
+			"one parameter":     func(to circuitbreaker.State) {},
+			"returns a value":   func(from, to circuitbreaker.State) error { return nil },
+			"not a func":        "not a func",
+		}
+
+		for name, listener := range wrong {
+			t.Run(name, func(t *testing.T) {
+				defer func() {
+					r := recover()
+					if r == nil {
+						t.Fatal("NewCircuitBreaker did not panic")
+					}
+
+					if msg := fmt.Sprint(r); !strings.Contains(msg, "state change listener") {
+						t.Errorf("panic message %q does not name the state change listener", msg)
+					}
+				}()
+
+				newBreaker(t, options.WithStateChangeListener(listener))
+			})
+		}
+	})
+
+	t.Run("a breaker whose options panicked is not registered", func(t *testing.T) {
+		key := fmt.Sprintf("options/%s#%d", t.Name(), breakerSeq.Add(1))
+		t.Cleanup(func() { circuitbreaker.RemoveCircuitBreaker(key) })
+
+		func() {
+			defer func() { _ = recover() }()
+
+			circuitbreaker.NewCircuitBreaker(key, options.WithStateChangeListener("not a func"))
+		}()
+
+		if _, exists := circuitbreaker.GetCircuitBreaker(key); exists {
+			t.Error("a breaker was registered although its options panicked")
+		}
 	})
 
 	t.Run("nil does not remove the listener", func(t *testing.T) {

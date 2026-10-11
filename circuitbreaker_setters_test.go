@@ -161,3 +161,67 @@ func TestRegressionNilErrorPredicateIsIgnored(t *testing.T) {
 		t.Fatalf("failure count: got %d, want 1", failures)
 	}
 }
+
+// Regression: SetStateChangeListener used to drop a value of the wrong type
+// without a word. A mistyped listener now panics, and a defined type with the
+// right signature is accepted.
+func TestRegressionStateChangeListenerType(t *testing.T) {
+	type namedListener func(from, to State)
+
+	t.Run("a defined func type is accepted", func(t *testing.T) {
+		cb := newTestBreaker(t)
+		called := make(chan struct{}, 1)
+
+		cb.SetStateChangeListener(namedListener(func(_, _ State) { called <- struct{}{} }))
+
+		_ = cb.Execute(context.Background(), fail)
+
+		select {
+		case <-called:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the listener was not called")
+		}
+	})
+
+	t.Run("nil keeps the earlier listener", func(t *testing.T) {
+		cb := newTestBreaker(t)
+		called := make(chan struct{}, 1)
+
+		cb.SetStateChangeListener(func(_, _ State) { called <- struct{}{} })
+		cb.SetStateChangeListener(nil)
+
+		_ = cb.Execute(context.Background(), fail)
+
+		select {
+		case <-called:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the listener was not called")
+		}
+	})
+
+	wrong := map[string]any{
+		"string parameters": func(from, to string) {},
+		"one parameter":     func(to State) {},
+		"returns a value":   func(from, to State) error { return nil },
+		"not a func":        42,
+	}
+
+	for name, listener := range wrong {
+		t.Run(name+" panics", func(t *testing.T) {
+			cb := newTestBreaker(t)
+
+			defer func() {
+				if recover() == nil {
+					t.Fatal("SetStateChangeListener did not panic")
+				}
+
+				// The panic must not leave the breaker locked.
+				if got := cb.GetState(); got != StateClosed {
+					t.Fatalf("state: got %v, want %v", got, StateClosed)
+				}
+			}()
+
+			cb.SetStateChangeListener(listener)
+		})
+	}
+}

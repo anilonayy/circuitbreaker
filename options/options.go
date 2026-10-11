@@ -161,9 +161,10 @@ func WithCustomErrorPredicate(predicate func(error) bool) Option {
 // a goroutine of its own for every transition.
 //
 // The parameter is typed any because this package cannot name the State type.
-// listener must be exactly a func(from, to circuitbreaker.State). A value of any
-// other type is ignored without an error, and so is nil: neither replaces a
-// listener set earlier.
+// listener must be a func(from, to circuitbreaker.State), or a value of a
+// defined type with that signature. nil is ignored and does not replace a
+// listener set earlier. A value of any other type makes NewCircuitBreaker
+// panic.
 //
 // Example usage:
 //

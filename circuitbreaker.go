@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 
@@ -388,15 +389,25 @@ func (cb *CircuitBreaker) ExecuteWithTimeout(ctx context.Context, fn func(contex
 		// The deferred function above records the failed request.
 		panic(r)
 	case <-ctxWithTimeout.Done():
-		// Timeout occurred - wait for goroutine to finish cleanup
 		duration = time.Since(start)
-		completed = true
-		cb.completeRequest(adm, false, duration)
 
 		// Wait for goroutine cleanup with a reasonable timeout
 		go func() {
 			<-done // Wait for goroutine to finish
 		}()
+
+		// The context ends with DeadlineExceeded when the request timeout or a
+		// deadline of the caller ran out. Canceled can only come from the
+		// caller: that is not a timeout, so it is passed on as it is and left
+		// to the error predicate below, the way Execute treats it.
+		if cause := ctxWithTimeout.Err(); errors.Is(cause, context.Canceled) {
+			err = cause
+
+			break
+		}
+
+		completed = true
+		cb.completeRequest(adm, false, duration)
 
 		return ErrCircuitBreakerTimeout
 	}
@@ -599,6 +610,10 @@ func (cb *CircuitBreaker) setState(newState State) {
 		cb.openedAt = &now
 	case StateClosed:
 		cb.openedAt = nil
+		// A closed breaker judges the dependency by what happens from now on.
+		// Without a fresh window the probes of the round that just closed it,
+		// failed ones included, would count towards opening it again.
+		cb.statistics = make(map[int64]*RequestStats)
 	case StateHalfOpen:
 		cb.statistics = make(map[int64]*RequestStats)
 		cb.resetHalfOpenCounters()
@@ -859,15 +874,46 @@ func (cb *CircuitBreaker) SetCustomErrorPredicate(predicate func(error) bool) {
 	}
 }
 
-// SetStateChangeListener sets a callback for state changes. listener must be a
-// func(from, to State); any other value is ignored. The callback runs in its own
-// goroutine for every transition.
+// SetStateChangeListener sets a callback for state changes. The callback runs
+// in its own goroutine for every transition.
+//
+// listener must be a func(from, to State), or a value of a defined type with
+// that signature. A nil interface value is ignored and keeps the listener set
+// earlier. Any other value is a programming error and panics, because a
+// listener that is dropped without a word leaves a breaker running without the
+// listener its owner thinks it has.
 func (cb *CircuitBreaker) SetStateChangeListener(listener any) {
+	if listener == nil {
+		return
+	}
+
+	l, ok := asStateChangeListener(listener)
+	if !ok {
+		panic(fmt.Sprintf("circuitbreaker: state change listener must be a func(from, to circuitbreaker.State), got %T", listener))
+	}
+
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+	cb.onStateChange = l
+}
+
+// asStateChangeListener returns listener as a func(from, to State). Besides the
+// plain func type it accepts a defined type with the same signature.
+func asStateChangeListener(listener any) (func(from, to State), bool) {
 	if l, ok := listener.(func(from, to State)); ok {
-		cb.onStateChange = l
+		return l, true
 	}
+
+	want := reflect.TypeFor[func(from, to State)]()
+
+	v := reflect.ValueOf(listener)
+	if v.Kind() != reflect.Func || !v.Type().ConvertibleTo(want) {
+		return nil, false
+	}
+
+	l, ok := v.Convert(want).Interface().(func(from, to State))
+
+	return l, ok
 }
 
 // SetRequestCompleteListener sets a callback for request completion. The

@@ -119,11 +119,13 @@ func TestDeadlineErrorsAreReportedAsTimeout(t *testing.T) {
 	}
 }
 
-// A caller that cancels its context is treated differently by the two execute
-// methods. Execute waits for fn and passes fn's error on, so the caller sees
-// context.Canceled and the error predicate decides whether it is a failure.
-// ExecuteWithTimeout stops waiting as soon as the context is done, for whatever
-// reason, and reports that as ErrCircuitBreakerTimeout and as a failure.
+// A caller that cancels its context gets context.Canceled from both execute
+// methods, and the error predicate decides whether it is a failure. Execute
+// waits for fn and passes fn's error on; ExecuteWithTimeout stops waiting as
+// soon as the context is done and reports the cancellation itself.
+//
+// Regression: ExecuteWithTimeout used to report a cancellation as
+// ErrCircuitBreakerTimeout and always count it as a failure.
 func TestCallerCancellation(t *testing.T) {
 	cancelAfter := func(d time.Duration) context.Context {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -170,17 +172,100 @@ func TestCallerCancellation(t *testing.T) {
 
 				return nil
 			})
-			if !errors.Is(err, ErrCircuitBreakerTimeout) {
-				t.Errorf("ExecuteWithTimeout returned %v, want %v", err, ErrCircuitBreakerTimeout)
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("ExecuteWithTimeout returned %v, want %v", err, context.Canceled)
+			}
+
+			if errors.Is(err, ErrCircuitBreakerTimeout) {
+				t.Errorf("ExecuteWithTimeout reported a cancellation as a timeout: %v", err)
 			}
 
 			if got := time.Since(start); got != time.Second {
 				t.Errorf("ExecuteWithTimeout returned after %v, want 1s", got)
 			}
 
+			// The default predicate counts every error, this one included.
 			if total, _, failures, _ := cb.GetStatistics(); total != 1 || failures != 1 {
 				t.Errorf("statistics = total %d, failures %d; want 1, 1", total, failures)
 			}
 		})
+	})
+
+	t.Run("ExecuteWithTimeout asks the error predicate", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			cb := newTestBreaker(t,
+				options.WithMinimumRequestThreshold(1_000_000),
+				options.WithCustomErrorPredicate(func(err error) bool {
+					return !errors.Is(err, context.Canceled)
+				}),
+			)
+
+			hang := make(chan struct{})
+			defer close(hang)
+
+			err := cb.ExecuteWithTimeout(cancelAfter(time.Second), func(context.Context) error {
+				<-hang
+
+				return nil
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("ExecuteWithTimeout returned %v, want %v", err, context.Canceled)
+			}
+
+			if total, _, failures, _ := cb.GetStatistics(); total != 1 || failures != 0 {
+				t.Errorf("statistics = total %d, failures %d; want 1, 0", total, failures)
+			}
+		})
+	})
+}
+
+// Regression: the probes of a half-open round stayed in the sliding window
+// after the breaker closed. With a failure rate threshold below the share of
+// failed probes a round may contain, the first request after closing, even a
+// successful one, opened the breaker again. Closing now starts a fresh window.
+func TestRegressionProbeResultsDoNotReopenAfterClose(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const openTimeout = 10 * time.Second
+
+		cb := newTestBreaker(t,
+			options.WithMinimumRequestThreshold(2),
+			options.WithFailureRateThreshold(0.3),
+			options.WithOpenTimeout(openTimeout),
+			options.WithThresholdRequestInHalfOpen(5),
+			options.WithTargetRateInHalfOpen(0.6),
+		)
+		ctx := context.Background()
+		succeed := func(context.Context) error { return nil }
+
+		for range 2 {
+			_ = cb.Execute(ctx, fail)
+		}
+
+		if got := cb.GetState(); got != StateOpen {
+			t.Fatalf("state after failures: got %v, want %v", got, StateOpen)
+		}
+
+		time.Sleep(openTimeout)
+
+		// Three of five probes succeed: exactly the target rate, so it closes.
+		for _, probe := range []func(context.Context) error{succeed, fail, succeed, fail, succeed} {
+			_ = cb.Execute(ctx, probe)
+		}
+
+		if got := cb.GetState(); got != StateClosed {
+			t.Fatalf("state after probes: got %v, want %v", got, StateClosed)
+		}
+
+		if total, _, failures, _ := cb.GetStatistics(); total != 0 || failures != 0 {
+			t.Errorf("statistics after closing = total %d, failures %d; want 0, 0", total, failures)
+		}
+
+		if err := cb.Execute(ctx, succeed); err != nil {
+			t.Fatalf("first request after closing: got %v, want nil", err)
+		}
+
+		if got := cb.GetState(); got != StateClosed {
+			t.Fatalf("state after a successful request: got %v, want %v", got, StateClosed)
+		}
 	})
 }
