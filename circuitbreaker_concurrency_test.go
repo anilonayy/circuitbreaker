@@ -18,6 +18,23 @@ import (
 // depends on the open timeout or the request timeout runs inside a synctest
 // bubble: time is virtual there and synctest.Wait blocks until every goroutine
 // has settled, so the tests neither sleep for real nor guess at scheduling.
+//
+// Several of them are regression tests: each pins down a bug this package
+// shipped with, and its comment starts with "Regression:" followed by what used
+// to go wrong. Run them on their own with
+//
+//	go test -race -run 'Regression' -v .
+//
+// which works because the bug is also named in the test function:
+//
+//	TestRegressionUnlockedAdmissionRace             canProceed read and wrote state without the lock
+//	TestRegressionOpenToHalfOpenHappensOnce         the same race, seen as duplicate transitions
+//	TestRegressionSettersRaceWithExecute            Set* raced with requests in flight
+//	TestRegressionHalfOpenOverAdmission             half-open let more than the threshold through
+//	TestRegressionHalfOpenStuckOnTimeout            a round of timed out probes never ended
+//	TestRegressionStaleRequestCountedAsProbe        a request admitted in CLOSED counted as a probe
+//	TestRegressionPanic...                          a panicking request was not recorded at all
+//	TestRegressionDetailedStatisticsLeakedPointers  statistics pointed into the live breaker
 
 const testOpenTimeout = time.Second
 
@@ -98,9 +115,13 @@ func (l *transitionLog) snapshot() []string {
 	return slices.Clone(l.got)
 }
 
+// Regression: canProceed used to read and write the state, the transition time
+// and the half-open counters without holding the lock, so concurrent Execute
+// calls raced with each other, with the recording path and with every reader.
+//
 // Many goroutines drive the breaker through every state while others read it.
 // The assertions are deliberately loose; the race detector is the real judge.
-func TestConcurrentExecuteIsRaceFree(t *testing.T) {
+func TestRegressionUnlockedAdmissionRace(t *testing.T) {
 	const (
 		workers    = 16
 		iterations = 300
@@ -187,8 +208,13 @@ func TestConcurrentExecuteIsRaceFree(t *testing.T) {
 	t.Logf("state changes observed: %d, completed requests observed: %d", transitions.Load(), completions.Load())
 }
 
-// The public setters may be called while requests are in flight.
-func TestSettersAreSafeDuringExecute(t *testing.T) {
+// Regression: Execute used to read the request timeout, the error predicate and
+// both listeners straight from the breaker while the Set* methods wrote them
+// under the lock, a data race for anyone reconfiguring a live breaker.
+//
+// The public setters may be called while requests are in flight. Like the test
+// above this one is decided by the race detector.
+func TestRegressionSettersRaceWithExecute(t *testing.T) {
 	const (
 		workers    = 8
 		iterations = 200
@@ -233,9 +259,14 @@ func TestSettersAreSafeDuringExecute(t *testing.T) {
 	checkState(t, cb, StateClosed)
 }
 
+// Regression: half-open used to compare the number of completed probes with the
+// threshold, so every caller that arrived before the first probe finished was
+// let through: twenty concurrent callers meant twenty probes against a
+// dependency that had just been failing, whatever the threshold said.
+//
 // Half-open must let through at most thresholdRequestInHalfOpen probes, counting
 // the ones that are still in flight, and reject everyone else.
-func TestHalfOpenAdmitsAtMostThresholdProbes(t *testing.T) {
+func TestRegressionHalfOpenOverAdmission(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const (
 			threshold = 3
@@ -300,9 +331,13 @@ func TestHalfOpenAdmitsAtMostThresholdProbes(t *testing.T) {
 	})
 }
 
+// Regression: with canProceed unlocked, each caller that found the open timeout
+// expired performed the OPEN -> HALF_OPEN transition itself, resetting the
+// probe counters under the others and firing the listener once per caller.
+//
 // Callers that hit an expired open timeout at the same instant must produce a
 // single OPEN -> HALF_OPEN transition and share one set of probe slots.
-func TestOpenToHalfOpenTransitionHappensOnce(t *testing.T) {
+func TestRegressionOpenToHalfOpenHappensOnce(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const (
 			threshold = 2
@@ -361,10 +396,15 @@ func TestOpenToHalfOpenTransitionHappensOnce(t *testing.T) {
 	})
 }
 
+// Regression: the timeout paths of Execute and ExecuteWithTimeout returned
+// before the half-open evaluation, so a timed out probe was never counted. A
+// dependency that hung instead of failing kept the breaker in half-open for
+// good: the round could not complete, and it kept admitting probes.
+//
 // A probe that times out is a failed probe. If every probe times out the
 // breaker must reopen instead of sitting in half-open, and it must still be
 // able to recover afterwards.
-func TestHalfOpenTimeoutsCountAsFailedProbes(t *testing.T) {
+func TestRegressionHalfOpenStuckOnTimeout(t *testing.T) {
 	const threshold = 3
 
 	honorsContext := func(ctx context.Context) error {
@@ -449,10 +489,15 @@ func TestHalfOpenTimeoutsCountAsFailedProbes(t *testing.T) {
 	}
 }
 
+// Regression: the outcome of every request that completed while the breaker was
+// half-open was counted as a probe result, including requests that had been
+// admitted long before, in CLOSED. One slow straggler could close or reopen the
+// breaker on evidence from before the outage.
+//
 // A request admitted while the breaker was closed can finish after the breaker
 // has opened and moved on to half-open. Its outcome says nothing about the
 // current probes and must not be counted as one of them.
-func TestHalfOpenIgnoresRequestsAdmittedEarlier(t *testing.T) {
+func TestRegressionStaleRequestCountedAsProbe(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cb := newTestBreaker(t,
 			options.WithThresholdRequestInHalfOpen(2),
@@ -587,9 +632,15 @@ func catchPanic(t *testing.T, f func()) (value any) {
 // is, neither replaced nor wrapped.
 type panicValue struct{ msg string }
 
+// Regression: a request whose fn panicked left no trace. Nothing was recorded
+// and the request complete listener never fired, so a dependency that failed by
+// panicking could not open the breaker. With ExecuteWithTimeout the panic
+// happened in fn's own goroutine and took the program down before the caller
+// could see it.
+//
 // A request whose fn panics is a failed request: it shows up in the statistics
 // and in the request complete listener, and the caller still gets the panic.
-func TestPanicInClosedStateCountsAsFailure(t *testing.T) {
+func TestRegressionPanicCountsAsFailure(t *testing.T) {
 	for _, variant := range executeVariants {
 		t.Run(variant.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -633,8 +684,11 @@ func TestPanicInClosedStateCountsAsFailure(t *testing.T) {
 	}
 }
 
+// Regression: a probe that panicked was admitted but never completed, so its
+// slot was lost and the half-open round could not reach a decision.
+//
 // In half-open a panicking probe is a failed probe.
-func TestPanicInHalfOpenCountsAsFailedProbe(t *testing.T) {
+func TestRegressionPanicCountsAsFailedProbe(t *testing.T) {
 	for _, variant := range executeVariants {
 		t.Run(variant.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -688,8 +742,11 @@ func TestPanicInHalfOpenCountsAsFailedProbe(t *testing.T) {
 	}
 }
 
+// Regression: panics were invisible to the failure rate, so the breaker stayed
+// closed in front of a dependency that panicked on every call.
+//
 // Panics feed the failure rate like any other failure and can open the breaker.
-func TestPanicsCanOpenTheBreaker(t *testing.T) {
+func TestRegressionPanicsCanOpenTheBreaker(t *testing.T) {
 	for _, variant := range executeVariants {
 		t.Run(variant.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -732,8 +789,11 @@ func TestPanicsCanOpenTheBreaker(t *testing.T) {
 	}
 }
 
+// Regression: a panic in the error predicate skipped the bookkeeping in the
+// same way as a panic in fn.
+//
 // A panic in the error predicate is treated like a panic in fn.
-func TestPanicInErrorPredicateCountsAsFailure(t *testing.T) {
+func TestRegressionPanicInErrorPredicateCountsAsFailure(t *testing.T) {
 	for _, variant := range executeVariants {
 		t.Run(variant.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -773,8 +833,12 @@ func TestPanicInErrorPredicateCountsAsFailure(t *testing.T) {
 	}
 }
 
+// Regression: GetDetailedStatistics used to return pointers to the breaker's
+// own half-open counters. The caller read them after the lock was released, a
+// data race, and the "statistics" it held kept changing with every request.
+//
 // GetDetailedStatistics returns a snapshot; later requests must not change it.
-func TestDetailedStatisticsIsASnapshot(t *testing.T) {
+func TestRegressionDetailedStatisticsLeakedPointers(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cb := newTestBreaker(t,
 			options.WithThresholdRequestInHalfOpen(3),
