@@ -38,7 +38,9 @@
 // [StateHalfOpen] is the trial. Entering it clears the statistics. The breaker
 // admits a fixed number of probe requests (see below) and, once all of them
 // have completed, closes if the share of successful probes reaches the target
-// rate and opens again otherwise.
+// rate and opens again otherwise. Closing clears the statistics as well: the
+// closed breaker starts with an empty window, so the probes that closed it,
+// failed ones included, do not count towards opening it again.
 //
 // # Half-open probe limit
 //
@@ -78,11 +80,11 @@
 // error that wraps [context.DeadlineExceeded] is turned into
 // ErrCircuitBreakerTimeout and counted as a failure without asking the error
 // predicate. That includes a deadline the function set up itself and a deadline
-// on the caller's context. A caller that cancels its context is handled
-// differently by the two methods: Execute returns the function's error
-// (normally [context.Canceled]) and lets the error predicate judge it, while
-// ExecuteWithTimeout, which stops waiting whenever the context is done, reports
-// it as ErrCircuitBreakerTimeout.
+// on the caller's context. A caller that cancels its context is not a timeout:
+// both methods return [context.Canceled] and let the error predicate judge it.
+// Execute gets there by returning the function's error, so it depends on the
+// function honoring its context; ExecuteWithTimeout stops waiting as soon as
+// the context is canceled and reports the cancellation itself.
 //
 // # Errors and the error predicate
 //
@@ -120,8 +122,11 @@
 // A panic in a listener is not recovered and terminates the program.
 //
 // The state change listener is passed as any, because the options package
-// cannot name [State]. It must be exactly a func(from, to State); a value of
-// any other type, including nil, is ignored without an error.
+// cannot name [State]. It must be a func(from, to State), or a value of a
+// defined type with that signature. A nil value is ignored and keeps the
+// listener set earlier; a value of any other type panics when it is set, so a
+// mistyped listener shows up when the breaker is created, not as a callback
+// that never fires.
 //
 // # The registry: one breaker per key
 //

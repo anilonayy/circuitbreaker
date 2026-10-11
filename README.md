@@ -87,7 +87,7 @@ stateDiagram-v2
 
 - Closed: traffic flows; failures are tracked in a sliding time window. Once the window holds at least the minimum number of requests and the failure rate reaches the threshold, the breaker opens.
 - Open: fast‑fail; rejects immediately; waits `openTimeout` before probing. There is no background timer: the breaker turns Half‑Open when the first request arrives after `openTimeout`, so an idle breaker keeps reporting `OPEN`.
-- Half‑Open: lets through at most `ThresholdRequestInHalfOpen` probe requests per round, counting the ones still in flight, and rejects the rest with `ErrCircuitBreakerOpen`. Once all probes have completed it closes if their success rate ≥ target, otherwise re‑opens. A probe that times out counts as a failed probe.
+- Half‑Open: lets through at most `ThresholdRequestInHalfOpen` probe requests per round, counting the ones still in flight, and rejects the rest with `ErrCircuitBreakerOpen`. Once all probes have completed it closes if their success rate ≥ target, otherwise re‑opens. A probe that times out counts as a failed probe. Closing starts a fresh window, so the probes of that round do not count towards opening again.
 
 The full semantics (timeouts, panics, listeners, the registry) are written up in the [package documentation](https://pkg.go.dev/github.com/anilonayy/circuitbreaker).
 
@@ -119,10 +119,10 @@ Import `github.com/anilonayy/circuitbreaker/options` and compose any of the opti
 | `WithThresholdRequestInHalfOpen(n int64)` | 10 | Probe requests admitted, and evaluated, per Half‑Open round. |
 | `WithTargetRateInHalfOpen(p float64)` | 0.6 | Share of successful probes (0–1) required to close again. |
 | `WithCustomErrorPredicate(func(error) bool)` | every non‑nil error is a failure | Decides which returned errors count as failures. Not asked about timeouts. |
-| `WithStateChangeListener(any)` | none | Callback for every state transition. Must be exactly a `func(from, to circuitbreaker.State)`. |
+| `WithStateChangeListener(any)` | none | Callback for every state transition. Must be a `func(from, to circuitbreaker.State)`; any other type panics. |
 | `WithRequestCompleteListener(func(success bool, d time.Duration))` | none | Callback for every admitted request with its outcome and duration. |
 
-Options are applied in order, so a later one overrides an earlier one. An option with an out‑of‑range value (a duration or count that is not positive, a rate outside 0–1, a `nil` predicate) is silently skipped and the previous value stays; no error is reported. `WithStateChangeListener` likewise ignores a value of any other type, including `nil`. The `Set*` methods on a breaker follow the same rule: an out‑of‑range value leaves the setting as it was.
+Options are applied in order, so a later one overrides an earlier one. An option with an out‑of‑range value (a duration or count that is not positive, a rate outside 0–1, a `nil` predicate) is silently skipped and the previous value stays; no error is reported. `WithStateChangeListener` skips `nil` the same way, but a value of the wrong type is a programming error and makes `NewCircuitBreaker` panic instead of leaving you with a listener that never fires. The `Set*` methods on a breaker follow the same rule: an out‑of‑range value leaves the setting as it was.
 
 Mind the two ends of the rate options: `WithFailureRateThreshold(0)` opens the breaker as soon as the minimum number of requests is reached, failures or not, and `WithTargetRateInHalfOpen(0)` closes it after the probes whatever their outcome.
 
@@ -270,7 +270,7 @@ curl -i 'localhost:8080/quote'                # … and now 503 until the open t
 Compare with `errors.Is`. Two details worth knowing:
 
 - A timeout is recognized by the error, not by the breaker's clock. A deadline your function set itself, or one on the caller's context, is reported as `ErrCircuitBreakerTimeout` too.
-- If the caller cancels its context, `Execute` returns your function's error (normally `context.Canceled`, a failure under the default predicate), while `ExecuteWithTimeout` reports it as `ErrCircuitBreakerTimeout`.
+- A caller that cancels its context is not a timeout: both `Execute` and `ExecuteWithTimeout` return `context.Canceled`, and the error predicate decides whether it counts (the default predicate says yes).
 
 ---
 
@@ -289,7 +289,7 @@ Compare with `errors.Is`. Two details worth knowing:
 ## Notes
 
 - Context‑aware: your function receives a context that is canceled at the request timeout. `Execute` waits for the function to return, so the function has to honor that context; one that ignores it and returns `nil` late is a success.
-- `ExecuteWithTimeout` does not rely on that: it runs the function in its own goroutine and returns `ErrCircuitBreakerTimeout` as soon as the context is done. The function keeps running in the background and its result is discarded, so use it for calls that cannot be canceled.
+- `ExecuteWithTimeout` does not rely on that: it runs the function in its own goroutine and returns as soon as the context is done: `ErrCircuitBreakerTimeout` at a deadline, `context.Canceled` if the caller canceled. The function keeps running in the background and its result is discarded, so use it for calls that cannot be canceled.
 - Panics: if the wrapped function (or the error predicate) panics, the request is recorded as a failure, exactly like a returned error (statistics, Half‑Open probe result, request‑complete hook with `success=false`), and the panic reaches the caller with its original value. The breaker never swallows a panic.
 - `NewCircuitBreaker(key, ...)` registers the breaker under `key`; calling it again with an existing key returns the already-registered breaker and ignores the new options. Breakers are never removed from the registry on their own, so use keys that name a dependency, not a request.
 - Stringer: `cb.String()` prints a compact summary for logs.
