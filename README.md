@@ -212,6 +212,8 @@ fmt.Println(details.State, details.Key)
 // marshals to JSON for a status endpoint
 ```
 
+Durations come twice: the `...Seconds` fields are whole seconds, rounded down, and the `...Millis` fields (`open_timeout_ms`, `request_timeout_ms`, `time_until_half_open_ms` in JSON) carry the exact value, so a timeout below one second does not read as 0.
+
 ### Registry utilities
 
 ```go
