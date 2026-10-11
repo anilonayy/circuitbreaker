@@ -38,11 +38,27 @@ func runOnVirtualClock(t *testing.T, test func(t *testing.T)) {
 	synctest.Test(t, test)
 }
 
+// freshKey returns key after making sure that no breaker is registered under
+// it, and removes the breaker the test registers there when the test ends.
+//
+// NewCircuitBreaker hands out the registered instance for a known key and
+// ignores the options passed with it, so a test that used a fixed key without
+// this would inherit the breaker, and the state, a previous test or a previous
+// -count iteration left behind.
+func freshKey(t *testing.T, key string) string {
+	t.Helper()
+
+	RemoveCircuitBreaker(key)
+	t.Cleanup(func() { RemoveCircuitBreaker(key) })
+
+	return key
+}
+
 func TestNewCircuitBreaker(t *testing.T) {
 	t.Logf("🔧 TEST START: Creating new circuit breaker with key 'test-service'")
 	startTime := time.Now()
 
-	cb := NewCircuitBreaker("test-service")
+	cb := NewCircuitBreaker(freshKey(t, "test-service"))
 	t.Logf("✅ Circuit breaker created successfully in %v", time.Since(startTime))
 
 	// Verify key assignment
@@ -79,7 +95,7 @@ func TestCircuitBreakerStates(t *testing.T) {
 	t.Logf("📋 Configuration: TimeWindow=%v, MinRequests=%d, FailureThreshold=%.1f%%, OpenTimeout=%v",
 		timeWindow, minRequests, failureThreshold*100, openTimeout)
 
-	cb := NewCircuitBreaker("test-service",
+	cb := NewCircuitBreaker(freshKey(t, "test-service"),
 		options.WithTimeWindow(timeWindow),
 		options.WithMinimumRequestThreshold(minRequests),
 		options.WithFailureRateThreshold(failureThreshold),
@@ -270,7 +286,7 @@ func TestCircuitBreakerStatistics(t *testing.T) {
 	highThreshold := int64(100) // Prevent circuit opening during stats test
 	t.Logf("📋 Configuration: MinThreshold=%d (high to prevent opening)", highThreshold)
 
-	cb := NewCircuitBreaker("test-service-stats",
+	cb := NewCircuitBreaker(freshKey(t, "test-service-stats"),
 		options.WithMinimumRequestThreshold(highThreshold),
 	)
 	t.Logf("✅ Circuit breaker created with key: %s", cb.GetKey())
@@ -400,7 +416,7 @@ func TestCustomErrorPredicate(t *testing.T) {
 		customError, otherError, highThreshold)
 
 	t.Logf("🔧 Creating circuit breaker with custom error predicate")
-	cb := NewCircuitBreaker("test-service-custom-error",
+	cb := NewCircuitBreaker(freshKey(t, "test-service-custom-error"),
 		options.WithCustomErrorPredicate(func(err error) bool {
 			isCustomError := err == customError
 			t.Logf("🔍 Error predicate called: error='%v', isCustomError=%t", err, isCustomError)
@@ -816,7 +832,7 @@ func TestGetDetailedStatisticsReturnsStruct(t *testing.T) {
 	t.Logf("📋 Configuration: Testing with key '%s' and default options", testKey)
 
 	setupStart := time.Now()
-	cb := NewCircuitBreaker(testKey)
+	cb := NewCircuitBreaker(freshKey(t, testKey))
 	setupDuration := time.Since(setupStart)
 	t.Logf("✅ Circuit breaker created in %v", setupDuration)
 
