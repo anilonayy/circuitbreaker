@@ -10,19 +10,24 @@ import (
 	"github.com/anilonayy/circuitbreaker/options"
 )
 
-// State represents the current state of the Circuit Breaker.
+// State is the state of a circuit breaker. The package documentation describes
+// what each state does and how a breaker moves between them.
 type State int
 
 const (
-	// StateClosed - Normal operating state, requests pass through.
+	// StateClosed is the normal operating state: requests pass through and
+	// their outcomes are tracked. It is the state a new breaker starts in.
 	StateClosed State = iota
-	// StateOpen - Circuit is open, all requests are blocked (fail-fast).
+	// StateOpen means the circuit is open: every request is rejected with
+	// ErrCircuitBreakerOpen until the open timeout has passed.
 	StateOpen
-	// StateHalfOpen - Limited test requests are allowed to check service health.
+	// StateHalfOpen means a limited number of probe requests is let through to
+	// find out whether the dependency has recovered; all others are rejected.
 	StateHalfOpen
 )
 
-// String returns the string representation of the state.
+// String returns the name of the state: "CLOSED", "OPEN" or "HALF_OPEN", and
+// "UNKNOWN" for any other value.
 func (s State) String() string {
 	switch s {
 	case StateClosed:
@@ -36,44 +41,80 @@ func (s State) String() string {
 	}
 }
 
-// RequestStats holds statistics for requests within a specific second.
+// RequestStats holds the request counters of one second of the sliding window.
 type RequestStats struct {
 	RequestCount int64 // Total number of requests in that second
 	SuccessCount int64 // Number of successful requests in that second
 	FailureCount int64 // Number of failed requests in that second
 }
 
-// DetailedStatistics holds detailed statistics for a circuit breaker.
+// DetailedStatistics describes a circuit breaker at one moment: its state, its
+// configuration and the counters of the current time window. It marshals to
+// JSON, so it can be served from a status endpoint as it is.
 //
 // It is a snapshot: the values, including the ones behind pointers, do not
-// change after GetDetailedStatistics returns. HalfOpenRequestCount is the number
-// of probes admitted in the current half-open round, in flight or completed;
-// HalfOpenSuccessCount and HalfOpenFailureCount cover the completed ones.
+// change after GetDetailedStatistics returns.
+//
+// The pointer fields depend on the state and are nil (omitted from JSON) in the
+// states they do not apply to: OpenedAt, NextHalfOpenAt and
+// TimeUntilHalfOpenSeconds are set while the breaker is open, the HalfOpen
+// fields and RemainingTestRequests while it is half-open.
+//
+// The fields ending in Seconds are whole seconds; a shorter duration, such as a
+// request timeout of 500ms, is reported as 0.
 type DetailedStatistics struct {
-	OpenedAt                   *string  `json:"opened_at,omitempty"`
-	HalfOpenSuccessRate        *float64 `json:"half_open_success_rate,omitempty"`
-	HalfOpenFailureCount       *int64   `json:"half_open_failure_count,omitempty"`
-	HalfOpenSuccessCount       *int64   `json:"half_open_success_count,omitempty"`
-	RemainingTestRequests      *int64   `json:"remaining_test_requests,omitempty"`
-	HalfOpenRequestCount       *int64   `json:"half_open_request_count,omitempty"`
-	TimeUntilHalfOpenSeconds   *int64   `json:"time_until_half_open_seconds,omitempty"`
-	NextHalfOpenAt             *string  `json:"next_half_open_at,omitempty"`
-	State                      string   `json:"state"`
-	Key                        string   `json:"key"`
-	FailureRate                float64  `json:"failure_rate"`
-	ThresholdRequestInHalfOpen int64    `json:"threshold_request_in_half_open"`
-	TargetRateInHalfOpen       float64  `json:"target_rate_in_half_open"`
-	RequestTimeoutSeconds      int64    `json:"request_timeout_seconds"`
-	OpenTimeoutSeconds         int64    `json:"open_timeout_seconds"`
-	FailureRateThreshold       float64  `json:"failure_rate_threshold"`
-	MinimumRequestThreshold    int64    `json:"minimum_request_threshold"`
-	TimeWindowSeconds          int64    `json:"time_window_seconds"`
-	FailureCount               int64    `json:"failure_count"`
-	SuccessCount               int64    `json:"success_count"`
-	TotalRequests              int64    `json:"total_requests"`
+	// OpenedAt is when the breaker opened, in RFC 3339 format.
+	OpenedAt *string `json:"opened_at,omitempty"`
+	// HalfOpenSuccessRate is the share of successful probes among the completed
+	// probes of the current round. It is nil until a probe has completed.
+	HalfOpenSuccessRate *float64 `json:"half_open_success_rate,omitempty"`
+	// HalfOpenFailureCount is the number of completed probes that failed.
+	HalfOpenFailureCount *int64 `json:"half_open_failure_count,omitempty"`
+	// HalfOpenSuccessCount is the number of completed probes that succeeded.
+	HalfOpenSuccessCount *int64 `json:"half_open_success_count,omitempty"`
+	// RemainingTestRequests is the number of probe slots still free in the
+	// current round.
+	RemainingTestRequests *int64 `json:"remaining_test_requests,omitempty"`
+	// HalfOpenRequestCount is the number of probes admitted in the current
+	// round, in flight or completed.
+	HalfOpenRequestCount *int64 `json:"half_open_request_count,omitempty"`
+	// TimeUntilHalfOpenSeconds is the time left until the open timeout has
+	// passed. It is nil once it has: the breaker then turns half-open with the
+	// next request.
+	TimeUntilHalfOpenSeconds *int64 `json:"time_until_half_open_seconds,omitempty"`
+	// NextHalfOpenAt is OpenedAt plus the open timeout, in RFC 3339 format.
+	NextHalfOpenAt *string `json:"next_half_open_at,omitempty"`
+	// State is the state's name as returned by State.String.
+	State string `json:"state"`
+	// Key is the key the breaker is registered under.
+	Key string `json:"key"`
+	// FailureRate is FailureCount divided by TotalRequests, 0 without requests.
+	FailureRate float64 `json:"failure_rate"`
+	// ThresholdRequestInHalfOpen is the number of probes per half-open round.
+	ThresholdRequestInHalfOpen int64 `json:"threshold_request_in_half_open"`
+	// TargetRateInHalfOpen is the share of successful probes needed to close.
+	TargetRateInHalfOpen float64 `json:"target_rate_in_half_open"`
+	// RequestTimeoutSeconds is the request timeout.
+	RequestTimeoutSeconds int64 `json:"request_timeout_seconds"`
+	// OpenTimeoutSeconds is how long the breaker stays open.
+	OpenTimeoutSeconds int64 `json:"open_timeout_seconds"`
+	// FailureRateThreshold is the failure rate at which the breaker opens.
+	FailureRateThreshold float64 `json:"failure_rate_threshold"`
+	// MinimumRequestThreshold is the number of requests the window must hold
+	// before the failure rate is acted on.
+	MinimumRequestThreshold int64 `json:"minimum_request_threshold"`
+	// TimeWindowSeconds is the length of the sliding window.
+	TimeWindowSeconds int64 `json:"time_window_seconds"`
+	// FailureCount is the number of failed requests in the window.
+	FailureCount int64 `json:"failure_count"`
+	// SuccessCount is the number of successful requests in the window.
+	SuccessCount int64 `json:"success_count"`
+	// TotalRequests is the number of completed requests in the window.
+	TotalRequests int64 `json:"total_requests"`
 }
 
-// CircuitBreaker represents a circuit breaker instance.
+// CircuitBreaker is a circuit breaker for one dependency. Create it with
+// NewCircuitBreaker; the zero value is not usable.
 //
 // All methods are safe for concurrent use. Every field below except key is
 // guarded by mu. Unexported methods documented as "mu must be held" rely on the
@@ -124,7 +165,15 @@ var (
 
 	registryMu sync.RWMutex
 
-	ErrCircuitBreakerOpen    = errors.New("circuit breaker is open")
+	// ErrCircuitBreakerOpen is returned by Execute and ExecuteWithTimeout when
+	// the request was rejected and the wrapped function was not called: the
+	// breaker is open, or it is half-open and all probe slots are taken.
+	ErrCircuitBreakerOpen = errors.New("circuit breaker is open")
+
+	// ErrCircuitBreakerTimeout is returned by Execute and ExecuteWithTimeout
+	// when the request ended in a deadline: the wrapped function returned an
+	// error wrapping context.DeadlineExceeded, or ExecuteWithTimeout stopped
+	// waiting for it. The request counts as a failure.
 	ErrCircuitBreakerTimeout = errors.New("circuit breaker request timeout")
 )
 
@@ -176,7 +225,8 @@ func NewCircuitBreaker(key string, opts ...options.Option) *CircuitBreaker {
 	return cb
 }
 
-// GetCircuitBreaker retrieves an existing circuit breaker by key.
+// GetCircuitBreaker returns the breaker registered under key. The second result
+// reports whether there is one; unlike NewCircuitBreaker it never creates it.
 func GetCircuitBreaker(key string) (*CircuitBreaker, bool) {
 	registryMu.RLock()
 	defer registryMu.RUnlock()
@@ -569,6 +619,10 @@ func triggerRequestCompleteEvent(listener func(success bool, duration time.Durat
 }
 
 // GetState returns the current state of the circuit breaker.
+//
+// The breaker leaves StateOpen when a request arrives after the open timeout,
+// not when the timeout expires, so GetState keeps returning StateOpen for an
+// idle breaker.
 func (cb *CircuitBreaker) GetState() State {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
@@ -576,7 +630,10 @@ func (cb *CircuitBreaker) GetState() State {
 	return cb.state
 }
 
-// GetStatistics returns current statistics within the time window.
+// GetStatistics returns the request counters of the current time window:
+// completed requests, how many of them succeeded and failed, and the failure
+// rate between 0 and 1. Rejected requests are not counted. The window starts
+// empty every time the breaker turns half-open.
 func (cb *CircuitBreaker) GetStatistics() (totalRequests, successCount, failureCount int64, failureRate float64) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
@@ -591,7 +648,8 @@ func (cb *CircuitBreaker) GetStatistics() (totalRequests, successCount, failureC
 	return totalRequests, successCount, failureCount, failureRate
 }
 
-// GetDetailedStatistics returns detailed statistics including open time and next half-open time.
+// GetDetailedStatistics returns a snapshot of the breaker's state, configuration
+// and counters. See DetailedStatistics for the fields.
 func (cb *CircuitBreaker) GetDetailedStatistics() DetailedStatistics {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
@@ -662,12 +720,13 @@ func (cb *CircuitBreaker) GetDetailedStatistics() DetailedStatistics {
 	return stats
 }
 
-// GetKey returns the unique key of this circuit breaker.
+// GetKey returns the key this circuit breaker was created with.
 func (cb *CircuitBreaker) GetKey() string {
 	return cb.key
 }
 
-// String returns a string representation of the circuit breaker.
+// String returns a one-line summary of the breaker for logs: key, state and
+// the counters of the current time window.
 func (cb *CircuitBreaker) String() string {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
@@ -687,14 +746,17 @@ func defaultIsFailure(err error) bool {
 	return err != nil
 }
 
-// RemoveCircuitBreaker removes a circuit breaker from the registry.
+// RemoveCircuitBreaker removes the breaker registered under key from the
+// registry, if there is one. The breaker itself keeps working for whoever still
+// holds it; the next NewCircuitBreaker call with key creates a new one.
 func RemoveCircuitBreaker(key string) {
 	registryMu.Lock()
 	defer registryMu.Unlock()
 	delete(circuitBreakerRegistry, key)
 }
 
-// ListCircuitBreakers returns all registered circuit breaker keys.
+// ListCircuitBreakers returns the keys of all registered circuit breakers, in
+// no particular order.
 func ListCircuitBreakers() []string {
 	registryMu.RLock()
 	defer registryMu.RUnlock()
@@ -707,58 +769,70 @@ func ListCircuitBreakers() []string {
 	return keys
 }
 
-// Setter methods to implement the CircuitBreakerConfig interface
+// The setters below implement options.CircuitBreakerConfig. They may be called
+// at any time, also while requests are in flight. They store the value as it
+// is: the range checks are done by the With functions of the options package,
+// not here.
 
-// SetTimeWindow sets the time window for failure analysis.
+// SetTimeWindow sets the time window for failure analysis. The window is
+// counted in whole seconds.
 func (cb *CircuitBreaker) SetTimeWindow(duration time.Duration) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	cb.timeWindow = duration
 }
 
-// SetMinimumRequestThreshold sets the minimum number of requests required.
+// SetMinimumRequestThreshold sets the number of requests the time window must
+// hold before the failure rate can open the breaker.
 func (cb *CircuitBreaker) SetMinimumRequestThreshold(threshold int64) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	cb.minimumRequestThreshold = threshold
 }
 
-// SetFailureRateThreshold sets the failure rate threshold.
+// SetFailureRateThreshold sets the failure rate, between 0 and 1, at which the
+// closed breaker opens.
 func (cb *CircuitBreaker) SetFailureRateThreshold(threshold float64) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	cb.failureRateThreshold = threshold
 }
 
-// SetOpenTimeout sets how long the circuit breaker stays open.
+// SetOpenTimeout sets how long the circuit breaker stays open before it lets
+// probes through. It applies to a breaker that is open right now as well.
 func (cb *CircuitBreaker) SetOpenTimeout(timeout time.Duration) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	cb.openTimeout = timeout
 }
 
-// SetRequestTimeout sets the maximum duration for individual requests.
+// SetRequestTimeout sets the maximum duration for individual requests. It
+// applies to requests admitted from now on.
 func (cb *CircuitBreaker) SetRequestTimeout(timeout time.Duration) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	cb.requestTimeout = timeout
 }
 
-// SetThresholdRequestInHalfOpen sets the threshold number of requests to evaluate in half-open state.
+// SetThresholdRequestInHalfOpen sets the number of probe requests admitted and
+// evaluated per half-open round.
 func (cb *CircuitBreaker) SetThresholdRequestInHalfOpen(threshold int64) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	cb.thresholdRequestInHalfOpen = threshold
 }
 
-// SetTargetRateInHalfOpen sets the target success rate required to close the circuit in half-open state.
+// SetTargetRateInHalfOpen sets the share of successful probes, between 0 and 1,
+// required to close the circuit after a half-open round.
 func (cb *CircuitBreaker) SetTargetRateInHalfOpen(rate float64) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	cb.targetRateInHalfOpen = rate
 }
 
-// SetCustomErrorPredicate sets a custom function to determine failures.
+// SetCustomErrorPredicate sets the function that decides whether an error
+// returned by the wrapped function counts as a failure. It is not asked about
+// nil errors or timeouts. predicate must not be nil.
 func (cb *CircuitBreaker) SetCustomErrorPredicate(predicate func(error) bool) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()

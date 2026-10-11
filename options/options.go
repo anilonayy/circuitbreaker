@@ -1,10 +1,26 @@
+// Package options holds the functional options that configure a circuit
+// breaker from github.com/anilonayy/circuitbreaker.
+//
+// Pass them to circuitbreaker.NewCircuitBreaker, one by one or as a preset such
+// as WithHTTPDefaults, optionally followed by overrides:
+//
+//	opts := append(options.WithHTTPDefaults(), options.WithOpenTimeout(time.Minute))
+//	cb := circuitbreaker.NewCircuitBreaker("search", opts...)
+//
+// Options are applied in order, so a later one overrides an earlier one.
+//
+// An option whose value is out of range (a duration or count that is not
+// positive, a rate outside 0 to 1, a nil predicate) does nothing: the breaker
+// keeps the value it had, and no error is reported.
 package options
 
 import (
 	"time"
 )
 
-// CircuitBreakerConfig represents the configurable fields of a circuit breaker.
+// CircuitBreakerConfig is the set of setters an Option works through. It is
+// implemented by *circuitbreaker.CircuitBreaker; the interface exists so that
+// this package does not have to import that one.
 type CircuitBreakerConfig interface {
 	SetTimeWindow(duration time.Duration)
 	SetMinimumRequestThreshold(threshold int64)
@@ -18,11 +34,14 @@ type CircuitBreakerConfig interface {
 	SetRequestCompleteListener(listener func(success bool, duration time.Duration))
 }
 
-// Option represents a functional option for configuring the Circuit Breaker.
+// Option configures one aspect of a circuit breaker. Options are created by the
+// With functions of this package and applied by circuitbreaker.NewCircuitBreaker.
 type Option func(CircuitBreakerConfig)
 
-// WithTimeWindow sets the time window for failure analysis
-// The time window must be in multiples of minutes (e.g., 1*time.Minute, 5*time.Minute)
+// WithTimeWindow sets the sliding time window over which the failure rate is
+// calculated. Outcomes are kept in one-second buckets, so the window is counted
+// in whole seconds and a fraction of a second is dropped.
+// A duration that is not positive is ignored.
 // Default: 1 minute.
 func WithTimeWindow(duration time.Duration) Option {
 	return func(cb CircuitBreakerConfig) {
@@ -32,8 +51,9 @@ func WithTimeWindow(duration time.Duration) Option {
 	}
 }
 
-// WithMinimumRequestThreshold sets the minimum number of requests required
-// before the circuit breaker starts analyzing failure rates
+// WithMinimumRequestThreshold sets the minimum number of requests the time
+// window must hold before the circuit breaker acts on the failure rate.
+// A threshold that is not positive is ignored.
 // Default: 10 requests.
 func WithMinimumRequestThreshold(threshold int64) Option {
 	return func(cb CircuitBreakerConfig) {
@@ -44,8 +64,13 @@ func WithMinimumRequestThreshold(threshold int64) Option {
 }
 
 // WithFailureRateThreshold sets the failure rate threshold (0.0 to 1.0)
-// that triggers the circuit breaker to open
-// Example: 0.5 means 50% failure rate
+// that triggers the circuit breaker to open: it opens when the rate is equal to
+// or above the threshold.
+// Example: 0.5 means 50% failure rate.
+// Both ends of the range are accepted. At 1.0 only a window in which every
+// request failed opens the breaker; at 0.0 it opens as soon as the minimum
+// number of requests is reached, failures or not.
+// A threshold outside the range is ignored.
 // Default: 0.5 (50%).
 func WithFailureRateThreshold(threshold float64) Option {
 	return func(cb CircuitBreakerConfig) {
@@ -56,7 +81,8 @@ func WithFailureRateThreshold(threshold float64) Option {
 }
 
 // WithOpenTimeout sets how long the circuit breaker stays in the Open state
-// before transitioning to Half-Open state
+// before transitioning to Half-Open state.
+// A timeout that is not positive is ignored.
 // Default: 30 seconds.
 func WithOpenTimeout(timeout time.Duration) Option {
 	return func(cb CircuitBreakerConfig) {
@@ -66,8 +92,10 @@ func WithOpenTimeout(timeout time.Duration) Option {
 	}
 }
 
-// WithRequestTimeout sets the maximum duration for individual requests
-// Requests exceeding this timeout will be canceled and counted as failures
+// WithRequestTimeout sets the maximum duration for individual requests.
+// The context passed to the wrapped function is canceled after this timeout,
+// and a request that ends in a deadline error is counted as a failure.
+// A timeout that is not positive is ignored.
 // Default: 5 seconds.
 func WithRequestTimeout(timeout time.Duration) Option {
 	return func(cb CircuitBreakerConfig) {
@@ -77,8 +105,10 @@ func WithRequestTimeout(timeout time.Duration) Option {
 	}
 }
 
-// WithThresholdRequestInHalfOpen sets the threshold number of requests to evaluate
-// in half-open state before making a transition decision
+// WithThresholdRequestInHalfOpen sets the number of probe requests admitted in
+// half-open state. The transition decision is made when all of them have
+// completed; requests beyond that number are rejected in the meantime.
+// A threshold that is not positive is ignored.
 // Default: 10 requests.
 func WithThresholdRequestInHalfOpen(threshold int64) Option {
 	return func(cb CircuitBreakerConfig) {
@@ -89,8 +119,11 @@ func WithThresholdRequestInHalfOpen(threshold int64) Option {
 }
 
 // WithTargetRateInHalfOpen sets the target success rate (0.0 to 1.0) required
-// to close the circuit when in half-open state
-// Example: 0.6 means 60% success rate is required
+// to close the circuit when in half-open state.
+// Example: 0.6 means 60% success rate is required.
+// Both ends of the range are accepted. At 0.0 the circuit closes after the
+// probes whatever their outcome.
+// A rate outside the range is ignored.
 // Default: 0.6 (60%).
 func WithTargetRateInHalfOpen(rate float64) Option {
 	return func(cb CircuitBreakerConfig) {
@@ -101,9 +134,11 @@ func WithTargetRateInHalfOpen(rate float64) Option {
 }
 
 // WithCustomErrorPredicate sets a custom function to determine
-// which errors should be considered as failures
-// The function should return true if the error represents a failure
-// Default: all non-nil errors are considered failures
+// which errors should be considered as failures.
+// The function should return true if the error represents a failure.
+// It is called with non-nil errors only, and not for timeouts, which always
+// count as failures. A nil predicate is ignored.
+// Default: all non-nil errors are considered failures.
 //
 // Example usage:
 //
@@ -121,12 +156,18 @@ func WithCustomErrorPredicate(predicate func(error) bool) Option {
 }
 
 // WithStateChangeListener sets a callback function that gets called
-// whenever the circuit breaker changes state
-// The callback receives the old state and new state as parameters
+// whenever the circuit breaker changes state.
+// The callback receives the old state and new state as parameters. It runs in
+// a goroutine of its own for every transition.
+//
+// The parameter is typed any because this package cannot name the State type.
+// listener must be exactly a func(from, to circuitbreaker.State). A value of any
+// other type is ignored without an error, and so is nil: neither replaces a
+// listener set earlier.
 //
 // Example usage:
 //
-//	WithStateChangeListener(func(from, to State) {
+//	WithStateChangeListener(func(from, to circuitbreaker.State) {
 //	    log.Printf("Circuit breaker state changed from %s to %s", from, to)
 //	})
 func WithStateChangeListener(listener any) Option {
@@ -135,6 +176,17 @@ func WithStateChangeListener(listener any) Option {
 	}
 }
 
+// WithRequestCompleteListener sets a callback function that gets called
+// after every request the circuit breaker admitted, with its outcome and its
+// duration. Requests rejected by an open breaker are not reported.
+// The callback runs in a goroutine of its own for every request.
+// A nil listener removes a listener set earlier.
+//
+// Example usage:
+//
+//	WithRequestCompleteListener(func(success bool, d time.Duration) {
+//	    requestDuration.WithLabelValues(strconv.FormatBool(success)).Observe(d.Seconds())
+//	})
 func WithRequestCompleteListener(listener func(success bool, duration time.Duration)) Option {
 	return func(cb CircuitBreakerConfig) {
 		cb.SetRequestCompleteListener(listener)
@@ -143,8 +195,11 @@ func WithRequestCompleteListener(listener func(success bool, duration time.Durat
 
 // Convenience functions for common configurations
 
-// WithDefaults returns the default configuration options
-// This is useful for explicitly setting defaults or as a base for customization.
+// WithDefaults returns a general-purpose preset as a base for customization.
+//
+// It is not identical to what a breaker uses when it is given no options at
+// all: this preset sets the minimum request threshold to 100, a breaker without
+// options uses 10. The other values are the same.
 func WithDefaults() []Option {
 	return []Option{
 		WithTimeWindow(60 * time.Second),
@@ -157,6 +212,9 @@ func WithDefaults() []Option {
 	}
 }
 
+// WithTestDefaults returns options for use in tests: like WithDefaults, but with
+// a minimum request threshold of 5 and a request timeout of 3 seconds, so a
+// breaker trips after a handful of requests.
 func WithTestDefaults() []Option {
 	return []Option{
 		WithTimeWindow(60 * time.Second),
@@ -197,7 +255,12 @@ func WithConservative() []Option {
 	}
 }
 
-// WithHTTPDefaults returns options optimized for HTTP requests.
+// WithHTTPDefaults returns options optimized for HTTP requests. It leaves the
+// half-open settings at their defaults.
+//
+// Its error predicate counts every non-nil error as a failure, like the
+// default one. Append WithCustomErrorPredicate to keep application-level errors
+// such as a 4xx response out of the failure rate.
 func WithHTTPDefaults() []Option {
 	return []Option{
 		WithTimeWindow(1 * time.Minute),
@@ -206,14 +269,16 @@ func WithHTTPDefaults() []Option {
 		WithOpenTimeout(30 * time.Second),
 		WithRequestTimeout(30 * time.Second), // Longer timeout for HTTP
 		WithCustomErrorPredicate(func(err error) bool {
-			// Consider timeouts and context cancellations as failures
-			// but not other application-level errors unless specified
+			// Every error is a failure, context cancellations included.
+			// Callers that want application-level errors left out append
+			// their own predicate.
 			return err != nil
 		}),
 	}
 }
 
-// WithDatabaseDefaults returns options optimized for database connections.
+// WithDatabaseDefaults returns options optimized for database connections. It
+// leaves the half-open settings at their defaults.
 func WithDatabaseDefaults() []Option {
 	return []Option{
 		WithTimeWindow(2 * time.Minute),      // Longer window for DB
@@ -224,7 +289,8 @@ func WithDatabaseDefaults() []Option {
 	}
 }
 
-// WithMicroserviceDefaults returns options optimized for microservice calls.
+// WithMicroserviceDefaults returns options optimized for microservice calls. It
+// leaves the half-open settings at their defaults.
 func WithMicroserviceDefaults() []Option {
 	return []Option{
 		WithTimeWindow(1 * time.Minute),
@@ -238,6 +304,8 @@ func WithMicroserviceDefaults() []Option {
 // Builder pattern for more complex configurations
 
 // ConfigBuilder provides a builder pattern for circuit breaker configuration.
+// Its methods mirror the With functions and append one option each; durations
+// are given in whole seconds. Build returns the collected options.
 type ConfigBuilder struct {
 	options []Option
 }
@@ -249,7 +317,7 @@ func NewConfigBuilder() *ConfigBuilder {
 	}
 }
 
-// TimeWindow adds a time window option to the builder.
+// TimeWindow adds a time window option, in seconds, to the builder.
 func (b *ConfigBuilder) TimeWindow(seconds int64) *ConfigBuilder {
 	b.options = append(b.options, WithTimeWindow(time.Duration(seconds)*time.Second))
 
@@ -270,14 +338,14 @@ func (b *ConfigBuilder) FailureRateThreshold(threshold float64) *ConfigBuilder {
 	return b
 }
 
-// OpenTimeout adds an open timeout option to the builder.
+// OpenTimeout adds an open timeout option, in seconds, to the builder.
 func (b *ConfigBuilder) OpenTimeout(seconds int64) *ConfigBuilder {
 	b.options = append(b.options, WithOpenTimeout(time.Duration(seconds)*time.Second))
 
 	return b
 }
 
-// RequestTimeout adds a request timeout option to the builder.
+// RequestTimeout adds a request timeout option, in seconds, to the builder.
 func (b *ConfigBuilder) RequestTimeout(seconds int64) *ConfigBuilder {
 	b.options = append(b.options, WithRequestTimeout(time.Duration(seconds)*time.Second))
 
@@ -319,7 +387,7 @@ func (b *ConfigBuilder) RequestCompleteListener(listener func(success bool, dura
 	return b
 }
 
-// Build returns the configured options.
+// Build returns the configured options in the order they were added.
 func (b *ConfigBuilder) Build() []Option {
 	return b.options
 }
