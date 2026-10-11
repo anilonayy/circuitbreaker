@@ -221,6 +221,7 @@ circuitbreaker.RemoveCircuitBreaker("billing")
 - Thread‑safe: a single internal lock protects state, configuration and metrics; admitting a request and recording its result are each atomic, so concurrent callers see one consistent state machine. The suite passes under `go test -race`.
 - Event hooks run asynchronously, each call in its own goroutine and outside the lock: they may call back into the breaker, and calls for successive events are not ordered.
 - Context‑aware: honors provided `context.Context` and enforces its own timeout.
+- Panics: if the wrapped function (or the error predicate) panics, the request is recorded as a failure, exactly like a returned error (statistics, Half‑Open probe result, request‑complete hook with `success=false`), and the panic reaches the caller with its original value. The breaker never swallows a panic.
 - `NewCircuitBreaker(key, ...)` registers the breaker under `key`; calling it again with an existing key returns the already-registered breaker and ignores the new options.
 - `ExecuteWithTimeout` is an alternative to `Execute` that coordinates goroutine completion around the breaker's timeout.
 - Stringer: `cb.String()` prints a compact summary for logs.

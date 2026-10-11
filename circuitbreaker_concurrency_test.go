@@ -533,36 +533,244 @@ func TestHalfOpenDecidesOnlyAfterThresholdProbes(t *testing.T) {
 	})
 }
 
-// A probe whose fn panics never reports a result, so it must hand its slot back.
-func TestHalfOpenProbeSlotIsReleasedOnPanic(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		cb := newTestBreaker(t,
-			options.WithThresholdRequestInHalfOpen(1),
-			options.WithTargetRateInHalfOpen(1.0),
-		)
-		ctx := context.Background()
+// executeFunc is the shape shared by Execute and ExecuteWithTimeout.
+type executeFunc func(context.Context, func(context.Context) error) error
 
-		tripOpen(t, cb)
-		time.Sleep(testOpenTimeout)
+// executeVariants lets a test run against both ways of executing a request.
+var executeVariants = []struct {
+	name string
+	pick func(*CircuitBreaker) executeFunc
+}{
+	{"Execute", func(cb *CircuitBreaker) executeFunc { return cb.Execute }},
+	{"ExecuteWithTimeout", func(cb *CircuitBreaker) executeFunc { return cb.ExecuteWithTimeout }},
+}
 
-		func() {
-			defer func() {
-				if recover() == nil {
-					t.Error("the panic did not reach the caller")
-				}
-			}()
+// completionLog collects the outcomes reported to a request complete listener.
+type completionLog struct {
+	mu  sync.Mutex
+	got []bool
+}
 
-			_ = cb.Execute(ctx, func(context.Context) error { panic("boom") })
-		}()
+func (l *completionLog) record(success bool, _ time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
-		checkState(t, cb, StateHalfOpen)
+	l.got = append(l.got, success)
+}
 
-		if err := cb.Execute(ctx, succeed); err != nil {
-			t.Errorf("probe after a panicking probe returned %v", err)
+func (l *completionLog) snapshot() []bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return slices.Clone(l.got)
+}
+
+// catchPanic runs f and returns the value it panicked with. It reports a test
+// error if f returns normally.
+func catchPanic(t *testing.T, f func()) (value any) {
+	t.Helper()
+
+	defer func() {
+		value = recover()
+		if value == nil {
+			t.Error("no panic reached the caller")
 		}
+	}()
 
-		checkState(t, cb, StateClosed)
-	})
+	f()
+
+	return nil
+}
+
+// panicValue is what the panicking functions below panic with. Comparing the
+// recovered value against the same pointer proves the panic was passed on as
+// is, neither replaced nor wrapped.
+type panicValue struct{ msg string }
+
+// A request whose fn panics is a failed request: it shows up in the statistics
+// and in the request complete listener, and the caller still gets the panic.
+func TestPanicInClosedStateCountsAsFailure(t *testing.T) {
+	for _, variant := range executeVariants {
+		t.Run(variant.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var completions completionLog
+
+				// The threshold keeps the breaker closed, whatever the failure rate.
+				cb := newTestBreaker(t,
+					options.WithMinimumRequestThreshold(1_000_000),
+					options.WithRequestCompleteListener(completions.record),
+				)
+				exec := variant.pick(cb)
+				ctx := context.Background()
+				want := &panicValue{"boom"}
+
+				got := catchPanic(t, func() {
+					_ = exec(ctx, func(context.Context) error { panic(want) })
+				})
+				if got != any(want) {
+					t.Errorf("caller recovered %#v, want the original panic value %#v", got, want)
+				}
+
+				total, successes, failures, _ := cb.GetStatistics()
+				if total != 1 || successes != 0 || failures != 1 {
+					t.Errorf("statistics = total %d, success %d, failure %d; want 1, 0, 1", total, successes, failures)
+				}
+
+				checkState(t, cb, StateClosed)
+
+				synctest.Wait() // the listener has run
+
+				if got, want := completions.snapshot(), []bool{false}; !slices.Equal(got, want) {
+					t.Errorf("request complete listener saw %v, want %v", got, want)
+				}
+
+				// The breaker keeps working after the panic.
+				if err := exec(ctx, succeed); err != nil {
+					t.Errorf("request after the panic returned %v", err)
+				}
+			})
+		})
+	}
+}
+
+// In half-open a panicking probe is a failed probe.
+func TestPanicInHalfOpenCountsAsFailedProbe(t *testing.T) {
+	for _, variant := range executeVariants {
+		t.Run(variant.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var completions completionLog
+
+				cb := newTestBreaker(t,
+					options.WithThresholdRequestInHalfOpen(2),
+					options.WithTargetRateInHalfOpen(1.0),
+				)
+				exec := variant.pick(cb)
+				ctx := context.Background()
+				want := &panicValue{"boom"}
+
+				tripOpen(t, cb)
+				time.Sleep(testOpenTimeout)
+
+				cb.SetRequestCompleteListener(completions.record)
+
+				got := catchPanic(t, func() {
+					_ = exec(ctx, func(context.Context) error { panic(want) })
+				})
+				if got != any(want) {
+					t.Errorf("caller recovered %#v, want the original panic value %#v", got, want)
+				}
+
+				// One of the two probes has completed, as a failure.
+				checkState(t, cb, StateHalfOpen)
+
+				stats := cb.GetDetailedStatistics()
+				if n := stats.HalfOpenFailureCount; n == nil || *n != 1 {
+					t.Errorf("HalfOpenFailureCount = %v, want 1", deref(n))
+				}
+				if n := stats.HalfOpenRequestCount; n == nil || *n != 1 {
+					t.Errorf("HalfOpenRequestCount = %v, want 1", deref(n))
+				}
+
+				synctest.Wait() // the listener has run
+
+				if got, want := completions.snapshot(), []bool{false}; !slices.Equal(got, want) {
+					t.Errorf("request complete listener saw %v, want %v", got, want)
+				}
+
+				if err := exec(ctx, succeed); err != nil {
+					t.Errorf("second probe returned %v", err)
+				}
+
+				// One failure and one success miss the 100% target: reopen.
+				checkState(t, cb, StateOpen)
+			})
+		})
+	}
+}
+
+// Panics feed the failure rate like any other failure and can open the breaker.
+func TestPanicsCanOpenTheBreaker(t *testing.T) {
+	for _, variant := range executeVariants {
+		t.Run(variant.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const minimumRequests = 3
+
+				cb := newTestBreaker(t, options.WithMinimumRequestThreshold(minimumRequests))
+				exec := variant.pick(cb)
+				ctx := context.Background()
+				want := &panicValue{"boom"}
+
+				for i := range minimumRequests {
+					checkState(t, cb, StateClosed)
+
+					got := catchPanic(t, func() {
+						_ = exec(ctx, func(context.Context) error { panic(want) })
+					})
+					if got != any(want) {
+						t.Errorf("panic %d: caller recovered %#v, want the original panic value %#v", i+1, got, want)
+					}
+				}
+
+				// The third failed request reaches the minimum and trips the breaker.
+				checkState(t, cb, StateOpen)
+
+				called := false
+
+				err := exec(ctx, func(context.Context) error {
+					called = true
+
+					return nil
+				})
+				if !errors.Is(err, ErrCircuitBreakerOpen) {
+					t.Errorf("request on the opened breaker returned %v, want %v", err, ErrCircuitBreakerOpen)
+				}
+				if called {
+					t.Error("fn was called although the breaker is open")
+				}
+			})
+		})
+	}
+}
+
+// A panic in the error predicate is treated like a panic in fn.
+func TestPanicInErrorPredicateCountsAsFailure(t *testing.T) {
+	for _, variant := range executeVariants {
+		t.Run(variant.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var completions completionLog
+
+				want := &panicValue{"predicate"}
+
+				cb := newTestBreaker(t,
+					options.WithThresholdRequestInHalfOpen(1),
+					options.WithRequestCompleteListener(completions.record),
+				)
+				exec := variant.pick(cb)
+				ctx := context.Background()
+
+				tripOpen(t, cb)
+				time.Sleep(testOpenTimeout)
+
+				cb.SetCustomErrorPredicate(func(error) bool { panic(want) })
+
+				got := catchPanic(t, func() { _ = exec(ctx, fail) })
+				if got != any(want) {
+					t.Errorf("caller recovered %#v, want the original panic value %#v", got, want)
+				}
+
+				// The only probe of the round failed, so the breaker reopens
+				// instead of waiting for a result that never comes.
+				checkState(t, cb, StateOpen)
+
+				synctest.Wait() // listeners have run
+
+				// tripOpen's failure, then the probe.
+				if got, want := completions.snapshot(), []bool{false, false}; !slices.Equal(got, want) {
+					t.Errorf("request complete listener saw %v, want %v", got, want)
+				}
+			})
+		})
+	}
 }
 
 // GetDetailedStatistics returns a snapshot; later requests must not change it.

@@ -195,6 +195,10 @@ func GetCircuitBreaker(key string) (*CircuitBreaker, bool) {
 // context.DeadlineExceeded the request counts as a failure and Execute returns
 // ErrCircuitBreakerTimeout. Any other error is passed to the error predicate
 // and returned unchanged.
+//
+// If fn or the error predicate panics, the request is recorded as a failure,
+// exactly like a returned error, and the panic continues to the caller with its
+// original value.
 func (cb *CircuitBreaker) Execute(ctx context.Context, fn func(context.Context) error) error {
 	// Check if we can proceed with the request
 	adm, ok := cb.canProceed()
@@ -202,13 +206,17 @@ func (cb *CircuitBreaker) Execute(ctx context.Context, fn func(context.Context) 
 		return ErrCircuitBreakerOpen
 	}
 
-	// If fn or the error predicate panics, the request never reports an outcome;
-	// hand back its half-open probe slot so the breaker cannot run out of them.
+	// Execute the function and measure duration
+	start := time.Now()
+
+	// A request that does not return normally, because fn or the error predicate
+	// panicked, is a failed request. Record it while the panic unwinds; the panic
+	// is not recovered here, so the caller sees it unchanged.
 	completed := false
 
 	defer func() {
 		if !completed {
-			cb.abandonRequest(adm)
+			cb.completeRequest(adm, false, time.Since(start))
 		}
 	}()
 
@@ -216,8 +224,6 @@ func (cb *CircuitBreaker) Execute(ctx context.Context, fn func(context.Context) 
 	ctxWithTimeout, cancel := context.WithTimeout(ctx, adm.requestTimeout)
 	defer cancel()
 
-	// Execute the function and measure duration
-	start := time.Now()
 	err := fn(ctxWithTimeout)
 	duration := time.Since(start)
 
@@ -243,6 +249,12 @@ func (cb *CircuitBreaker) Execute(ctx context.Context, fn func(context.Context) 
 // ErrCircuitBreakerTimeout as soon as the request timeout expires, recording a
 // failure. In that case fn keeps running in the background until it returns and
 // its result is discarded.
+//
+// If fn or the error predicate panics, the request is recorded as a failure and
+// the panic is raised again in the caller's goroutine with its original value.
+// A panic in fn after ExecuteWithTimeout has already returned on timeout has no
+// caller left to go to; it is not swallowed and terminates the program like any
+// other unrecovered panic.
 func (cb *CircuitBreaker) ExecuteWithTimeout(ctx context.Context, fn func(context.Context) error) error {
 	// Check if we can proceed with the request
 	adm, ok := cb.canProceed()
@@ -250,13 +262,17 @@ func (cb *CircuitBreaker) ExecuteWithTimeout(ctx context.Context, fn func(contex
 		return ErrCircuitBreakerOpen
 	}
 
-	// If the error predicate panics, the request never reports an outcome; hand
-	// back its half-open probe slot so the breaker cannot run out of them.
+	// Execute the function with proper timeout handling
+	start := time.Now()
+
+	// A request that ends in a panic, whether from the error predicate or from
+	// fn (re-raised below), is a failed request. Record it while the panic
+	// unwinds this call; the caller sees the panic unchanged.
 	completed := false
 
 	defer func() {
 		if !completed {
-			cb.abandonRequest(adm)
+			cb.completeRequest(adm, false, time.Since(start))
 		}
 	}()
 
@@ -264,15 +280,34 @@ func (cb *CircuitBreaker) ExecuteWithTimeout(ctx context.Context, fn func(contex
 	ctxWithTimeout, cancel := context.WithTimeout(ctx, adm.requestTimeout)
 	defer cancel()
 
-	// Execute the function with proper timeout handling
-	start := time.Now()
-
 	resultChan := make(chan error, 1)
 	done := make(chan struct{})
+
+	// panicChan carries a panic out of fn's goroutine. It is unbuffered, so a
+	// value is handed over only while this call is still waiting for it;
+	// callerGone tells the goroutine that it no longer is.
+	panicChan := make(chan any)
+	callerGone := make(chan struct{})
+
+	defer close(callerGone)
 
 	// Execute function in goroutine with proper cleanup
 	go func() {
 		defer close(done) // Signal that goroutine is finishing
+
+		defer func() {
+			r := recover()
+			if r == nil {
+				return
+			}
+
+			select {
+			case panicChan <- r:
+			case <-callerGone:
+				// Nobody is left to receive the panic; do not swallow it.
+				panic(r)
+			}
+		}()
 
 		select {
 		case resultChan <- fn(ctxWithTimeout):
@@ -298,6 +333,10 @@ func (cb *CircuitBreaker) ExecuteWithTimeout(ctx context.Context, fn func(contex
 
 			return ErrCircuitBreakerTimeout
 		}
+	case r := <-panicChan:
+		// fn panicked: continue the panic here, in the caller's goroutine.
+		// The deferred function above records the failed request.
+		panic(r)
 	case <-ctxWithTimeout.Done():
 		// Timeout occurred - wait for goroutine to finish cleanup
 		duration = time.Since(start)
@@ -384,17 +423,6 @@ func (cb *CircuitBreaker) completeRequest(adm admission, success bool, duration 
 	cb.mu.Unlock()
 
 	triggerRequestCompleteEvent(listener, success, duration)
-}
-
-// abandonRequest gives back the half-open probe slot of an admitted request
-// that ended without an outcome. Nothing is recorded for the request.
-func (cb *CircuitBreaker) abandonRequest(adm admission) {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-
-	if adm.halfOpenProbe && adm.generation == cb.generation {
-		cb.halfOpenRequestCount--
-	}
 }
 
 // recordRequest records the outcome of a request in the statistics and, while
@@ -749,7 +777,8 @@ func (cb *CircuitBreaker) SetStateChangeListener(listener any) {
 }
 
 // SetRequestCompleteListener sets a callback for request completion. The
-// callback runs in its own goroutine for every completed request.
+// callback runs in its own goroutine for every completed request; a request
+// that timed out or panicked is reported with success=false.
 func (cb *CircuitBreaker) SetRequestCompleteListener(listener func(success bool, duration time.Duration)) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
