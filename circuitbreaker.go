@@ -44,6 +44,11 @@ type RequestStats struct {
 }
 
 // DetailedStatistics holds detailed statistics for a circuit breaker.
+//
+// It is a snapshot: the values, including the ones behind pointers, do not
+// change after GetDetailedStatistics returns. HalfOpenRequestCount is the number
+// of probes admitted in the current half-open round, in flight or completed;
+// HalfOpenSuccessCount and HalfOpenFailureCount cover the completed ones.
 type DetailedStatistics struct {
 	OpenedAt                   *string  `json:"opened_at,omitempty"`
 	HalfOpenSuccessRate        *float64 `json:"half_open_success_rate,omitempty"`
@@ -69,6 +74,12 @@ type DetailedStatistics struct {
 }
 
 // CircuitBreaker represents a circuit breaker instance.
+//
+// All methods are safe for concurrent use. Every field below except key is
+// guarded by mu. Unexported methods documented as "mu must be held" rely on the
+// caller for locking; everything else takes the lock itself. User supplied
+// callbacks (the request function, the error predicate and both listeners) are
+// never invoked while mu is held, so they may call back into the breaker.
 type CircuitBreaker struct {
 	stateTransitionTime        time.Time
 	openedAt                   *time.Time
@@ -88,7 +99,23 @@ type CircuitBreaker struct {
 	timeWindow                 time.Duration
 	state                      State
 	minimumRequestThreshold    int64
-	mu                         sync.Mutex
+	// generation is incremented on every state transition. A request remembers
+	// the generation it was admitted in, which lets a late result be told apart
+	// from the results of the current half-open round.
+	generation uint64
+	mu         sync.Mutex
+}
+
+// admission is what a request carries from the moment the breaker lets it
+// through until its outcome is recorded. It is filled in under mu, so the
+// request itself runs without touching shared configuration.
+type admission struct {
+	isFailure      func(error) bool
+	requestTimeout time.Duration
+	generation     uint64
+	// halfOpenProbe reports whether the request occupies one of the
+	// thresholdRequestInHalfOpen probe slots of its generation.
+	halfOpenProbe bool
 }
 
 var (
@@ -101,7 +128,14 @@ var (
 	ErrCircuitBreakerTimeout = errors.New("circuit breaker request timeout")
 )
 
-// NewCircuitBreaker creates a new circuit breaker instance with the given key and options.
+// NewCircuitBreaker creates a new circuit breaker instance with the given key and options
+// and registers it under key.
+//
+// Breakers are shared by key: if a breaker is already registered under key, that
+// instance is returned as is and opts are ignored. This holds even when opts differ
+// from the options the breaker was created with, and no error is reported. To
+// reconfigure a registered breaker use its Set* methods, or call RemoveCircuitBreaker
+// first to start over with a fresh instance.
 func NewCircuitBreaker(key string, opts ...options.Option) *CircuitBreaker {
 	registryMu.Lock()
 	defer registryMu.Unlock()
@@ -152,14 +186,34 @@ func GetCircuitBreaker(key string) (*CircuitBreaker, bool) {
 	return cb, exists
 }
 
+// Execute runs fn if the breaker admits the request and records its outcome.
+//
+// It returns ErrCircuitBreakerOpen without calling fn when the breaker is open,
+// or when it is half-open and all probe slots are taken. fn receives a context
+// that is canceled after the request timeout; Execute itself waits for fn to
+// return, so fn has to honor that context. If fn returns an error wrapping
+// context.DeadlineExceeded the request counts as a failure and Execute returns
+// ErrCircuitBreakerTimeout. Any other error is passed to the error predicate
+// and returned unchanged.
 func (cb *CircuitBreaker) Execute(ctx context.Context, fn func(context.Context) error) error {
 	// Check if we can proceed with the request
-	if !cb.canProceed() {
+	adm, ok := cb.canProceed()
+	if !ok {
 		return ErrCircuitBreakerOpen
 	}
 
+	// If fn or the error predicate panics, the request never reports an outcome;
+	// hand back its half-open probe slot so the breaker cannot run out of them.
+	completed := false
+
+	defer func() {
+		if !completed {
+			cb.abandonRequest(adm)
+		}
+	}()
+
 	// Create context with timeout
-	ctxWithTimeout, cancel := context.WithTimeout(ctx, cb.requestTimeout)
+	ctxWithTimeout, cancel := context.WithTimeout(ctx, adm.requestTimeout)
 	defer cancel()
 
 	// Execute the function and measure duration
@@ -169,36 +223,45 @@ func (cb *CircuitBreaker) Execute(ctx context.Context, fn func(context.Context) 
 
 	// Handle timeout case
 	if errors.Is(err, context.DeadlineExceeded) {
-		cb.recordRequest(false)
-		cb.triggerRequestCompleteEvent(false, duration)
+		completed = true
+		cb.completeRequest(adm, false, duration)
 
 		return ErrCircuitBreakerTimeout
 	}
 
 	// Determine if this is a failure based on custom predicate
-	isSuccess := err == nil || !cb.isFailure(err)
+	isSuccess := err == nil || !adm.isFailure(err)
 
-	// Record the request
-	cb.recordRequest(isSuccess)
-
-	// Trigger event
-	cb.triggerRequestCompleteEvent(isSuccess, duration)
-
-	// Update state based on result (especially important for half-open state)
-	cb.updateStateAfterRequest(isSuccess)
+	completed = true
+	cb.completeRequest(adm, isSuccess, duration)
 
 	return err
 }
 
-// Execute wraps a function call with circuit breaker logic.
+// ExecuteWithTimeout is like Execute, but does not rely on fn to honor its
+// context: fn runs in its own goroutine and ExecuteWithTimeout returns
+// ErrCircuitBreakerTimeout as soon as the request timeout expires, recording a
+// failure. In that case fn keeps running in the background until it returns and
+// its result is discarded.
 func (cb *CircuitBreaker) ExecuteWithTimeout(ctx context.Context, fn func(context.Context) error) error {
 	// Check if we can proceed with the request
-	if !cb.canProceed() {
+	adm, ok := cb.canProceed()
+	if !ok {
 		return ErrCircuitBreakerOpen
 	}
 
+	// If the error predicate panics, the request never reports an outcome; hand
+	// back its half-open probe slot so the breaker cannot run out of them.
+	completed := false
+
+	defer func() {
+		if !completed {
+			cb.abandonRequest(adm)
+		}
+	}()
+
 	// Create context with timeout
-	ctxWithTimeout, cancel := context.WithTimeout(ctx, cb.requestTimeout)
+	ctxWithTimeout, cancel := context.WithTimeout(ctx, adm.requestTimeout)
 	defer cancel()
 
 	// Execute the function with proper timeout handling
@@ -230,16 +293,16 @@ func (cb *CircuitBreaker) ExecuteWithTimeout(ctx context.Context, fn func(contex
 
 		// Handle timeout case that might be returned by the function
 		if errors.Is(err, context.DeadlineExceeded) {
-			cb.recordRequest(false)
-			cb.triggerRequestCompleteEvent(false, duration)
+			completed = true
+			cb.completeRequest(adm, false, duration)
 
 			return ErrCircuitBreakerTimeout
 		}
 	case <-ctxWithTimeout.Done():
 		// Timeout occurred - wait for goroutine to finish cleanup
 		duration = time.Since(start)
-		cb.recordRequest(false)
-		cb.triggerRequestCompleteEvent(false, duration)
+		completed = true
+		cb.completeRequest(adm, false, duration)
 
 		// Wait for goroutine cleanup with a reasonable timeout
 		go func() {
@@ -250,58 +313,94 @@ func (cb *CircuitBreaker) ExecuteWithTimeout(ctx context.Context, fn func(contex
 	}
 
 	// Determine if this is a failure based on custom predicate
-	isSuccess := err == nil || !cb.isFailure(err)
+	isSuccess := err == nil || !adm.isFailure(err)
 
-	// Record the request
-	cb.recordRequest(isSuccess)
-
-	// Trigger event
-	cb.triggerRequestCompleteEvent(isSuccess, duration)
-
-	// Update state based on result (especially important for half-open state)
-	cb.updateStateAfterRequest(isSuccess)
+	completed = true
+	cb.completeRequest(adm, isSuccess, duration)
 
 	return err
 }
 
-// canProceed determines if a request can proceed based on current state.
-func (cb *CircuitBreaker) canProceed() bool {
-	handleStateHalfOpen := func() bool {
-		// Allow requests up to the threshold for evaluation
-		totalHalfOpenRequests := cb.halfOpenSuccessCount + cb.halfOpenFailureCount
-		if totalHalfOpenRequests < cb.thresholdRequestInHalfOpen {
-			cb.halfOpenRequestCount++
+// canProceed decides whether a request may run in the current state and, if so,
+// returns its admission. It is the only place where OPEN turns into HALF_OPEN.
+//
+// The decision and the bookkeeping happen in one critical section, so callers
+// racing through an expired open timeout see a single transition and share one
+// set of probe slots. In half-open a slot is taken when a probe is admitted,
+// not when it completes: at most thresholdRequestInHalfOpen probes are ever in
+// flight, however many callers arrive at once.
+func (cb *CircuitBreaker) canProceed() (admission, bool) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
 
-			return true
-		}
+	// Check if we should transition to half-open
+	if cb.state == StateOpen && time.Since(cb.stateTransitionTime) >= cb.openTimeout {
+		cb.setState(StateHalfOpen)
+	}
 
-		return false
+	adm := admission{
+		isFailure:      cb.isFailure,
+		requestTimeout: cb.requestTimeout,
+		generation:     cb.generation,
 	}
 
 	switch cb.state {
 	case StateClosed:
-		return true
-	case StateOpen:
-		// Check if we should transition to half-open
-		if time.Since(cb.stateTransitionTime) >= cb.openTimeout {
-			cb.setState(StateHalfOpen)
-
-			return handleStateHalfOpen()
+		return adm, true
+	case StateHalfOpen:
+		// Allow requests up to the threshold for evaluation
+		if cb.halfOpenRequestCount >= cb.thresholdRequestInHalfOpen {
+			return admission{}, false
 		}
 
-		return false
-	case StateHalfOpen:
-		return handleStateHalfOpen()
+		cb.halfOpenRequestCount++
+		adm.halfOpenProbe = true
+
+		return adm, true
 	default:
-		return false
+		return admission{}, false
 	}
 }
 
-// recordRequest records the outcome of a request and updates statistics.
-func (cb *CircuitBreaker) recordRequest(success bool) {
+// completeRequest records the outcome of an admitted request, applies any state
+// change that follows from it and notifies the request complete listener.
+//
+// Statistics and state are updated in a single critical section, so no other
+// request can observe the outcome half applied.
+func (cb *CircuitBreaker) completeRequest(adm admission, success bool, duration time.Duration) {
+	cb.mu.Lock()
+
+	cb.recordRequest(success)
+
+	// The generation changes on every transition, so a matching generation means
+	// the breaker is still in the half-open round this probe was admitted in.
+	// Results of requests admitted earlier are left out of the evaluation.
+	if adm.halfOpenProbe && adm.generation == cb.generation {
+		cb.updateStateAfterRequest(success)
+	}
+
+	listener := cb.onRequestComplete
+
+	cb.mu.Unlock()
+
+	triggerRequestCompleteEvent(listener, success, duration)
+}
+
+// abandonRequest gives back the half-open probe slot of an admitted request
+// that ended without an outcome. Nothing is recorded for the request.
+func (cb *CircuitBreaker) abandonRequest(adm admission) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
+	if adm.halfOpenProbe && adm.generation == cb.generation {
+		cb.halfOpenRequestCount--
+	}
+}
+
+// recordRequest records the outcome of a request in the statistics and, while
+// the breaker is closed, opens it if the failure rate calls for it.
+// mu must be held.
+func (cb *CircuitBreaker) recordRequest(success bool) {
 	now := time.Now().Unix()
 
 	if cb.statistics[now] == nil {
@@ -322,41 +421,39 @@ func (cb *CircuitBreaker) recordRequest(success bool) {
 	}
 }
 
-// updateStateAfterRequest updates the circuit breaker state after a request in half-open state.
+// updateStateAfterRequest counts a completed probe of the current half-open
+// round and, once thresholdRequestInHalfOpen probes have completed, closes or
+// reopens the breaker depending on their success rate. mu must be held.
 func (cb *CircuitBreaker) updateStateAfterRequest(success bool) {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-
-	if cb.state == StateHalfOpen {
-		if success {
-			cb.halfOpenSuccessCount++
-		} else {
-			cb.halfOpenFailureCount++
-		}
-
-		totalHalfOpenRequests := cb.halfOpenSuccessCount + cb.halfOpenFailureCount
-
-		if totalHalfOpenRequests >= cb.thresholdRequestInHalfOpen {
-			successRate := float64(cb.halfOpenSuccessCount) / float64(totalHalfOpenRequests)
-
-			if successRate >= cb.targetRateInHalfOpen {
-				// Success rate meets target, close the circuit
-				cb.setState(StateClosed)
-				cb.resetHalfOpenCounters()
-			} else {
-				// Success rate below target, open the circuit
-				cb.setState(StateOpen)
-				cb.resetHalfOpenCounters()
-			}
-		} else if totalHalfOpenRequests >= cb.thresholdRequestInHalfOpen &&
-			cb.halfOpenFailureCount >= int64(float64(totalHalfOpenRequests)*cb.failureRateThreshold) {
-			cb.setState(StateOpen)
-			cb.resetHalfOpenCounters()
-		}
+	if cb.state != StateHalfOpen {
+		return
 	}
+
+	if success {
+		cb.halfOpenSuccessCount++
+	} else {
+		cb.halfOpenFailureCount++
+	}
+
+	totalHalfOpenRequests := cb.halfOpenSuccessCount + cb.halfOpenFailureCount
+	if totalHalfOpenRequests < cb.thresholdRequestInHalfOpen {
+		return
+	}
+
+	successRate := float64(cb.halfOpenSuccessCount) / float64(totalHalfOpenRequests)
+
+	if successRate >= cb.targetRateInHalfOpen {
+		// Success rate meets target, close the circuit
+		cb.setState(StateClosed)
+	} else {
+		// Success rate below target, open the circuit
+		cb.setState(StateOpen)
+	}
+
+	cb.resetHalfOpenCounters()
 }
 
-// resetHalfOpenCounters resets the half-open state counters.
+// resetHalfOpenCounters resets the half-open state counters. mu must be held.
 func (cb *CircuitBreaker) resetHalfOpenCounters() {
 	cb.halfOpenRequestCount = 0
 	cb.halfOpenSuccessCount = 0
@@ -364,6 +461,7 @@ func (cb *CircuitBreaker) resetHalfOpenCounters() {
 }
 
 // checkAndUpdateState checks failure rate and updates state if necessary.
+// mu must be held.
 func (cb *CircuitBreaker) checkAndUpdateState() {
 	totalRequests, totalFailures := cb.getStatisticsInWindow()
 
@@ -379,6 +477,7 @@ func (cb *CircuitBreaker) checkAndUpdateState() {
 }
 
 // getStatisticsInWindow calculates total requests and failures within the time window.
+// mu must be held.
 func (cb *CircuitBreaker) getStatisticsInWindow() (totalRequests, totalFailures int64) {
 	now := time.Now().Unix()
 	windowStart := now - int64(cb.timeWindow.Seconds())
@@ -393,7 +492,7 @@ func (cb *CircuitBreaker) getStatisticsInWindow() (totalRequests, totalFailures 
 	return totalRequests, totalFailures
 }
 
-// cleanOldStatistics removes statistics older than the time window.
+// cleanOldStatistics removes statistics older than the time window. mu must be held.
 func (cb *CircuitBreaker) cleanOldStatistics() {
 	now := time.Now().Unix()
 	windowStart := now - int64(cb.timeWindow.Seconds())
@@ -405,18 +504,16 @@ func (cb *CircuitBreaker) cleanOldStatistics() {
 	}
 }
 
-func (cb *CircuitBreaker) cleanAllStatistics() {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-
-	cb.statistics = make(map[int64]*RequestStats)
-}
-
-// setState changes the circuit breaker state and triggers events.
+// setState changes the circuit breaker state and triggers events. mu must be held.
+//
+// The state change listener runs in its own goroutine, so it is not covered by
+// the caller's lock and may call back into the breaker. Listener calls for
+// successive transitions are not ordered relative to each other.
 func (cb *CircuitBreaker) setState(newState State) {
 	oldState := cb.state
 	cb.state = newState
 	cb.stateTransitionTime = time.Now()
+	cb.generation++
 
 	switch newState {
 	case StateOpen:
@@ -425,7 +522,7 @@ func (cb *CircuitBreaker) setState(newState State) {
 	case StateClosed:
 		cb.openedAt = nil
 	case StateHalfOpen:
-		cb.cleanAllStatistics()
+		cb.statistics = make(map[int64]*RequestStats)
 		cb.resetHalfOpenCounters()
 	}
 
@@ -435,10 +532,11 @@ func (cb *CircuitBreaker) setState(newState State) {
 }
 
 // triggerRequestCompleteEvent triggers the request completion event.
-func (cb *CircuitBreaker) triggerRequestCompleteEvent(success bool, duration time.Duration) {
-	if cb.onRequestComplete != nil {
+// It must be called without mu held.
+func triggerRequestCompleteEvent(listener func(success bool, duration time.Duration), success bool, duration time.Duration) {
+	if listener != nil {
 		// Call event handler without holding the lock to prevent deadlocks
-		go cb.onRequestComplete(success, duration)
+		go listener(success, duration)
 	}
 }
 
@@ -512,17 +610,23 @@ func (cb *CircuitBreaker) GetDetailedStatistics() DetailedStatistics {
 
 	// Add half-open specific information
 	if cb.state == StateHalfOpen {
-		stats.HalfOpenRequestCount = &cb.halfOpenRequestCount
-		remainingTestRequests := cb.thresholdRequestInHalfOpen - cb.halfOpenRequestCount
+		// Copy the counters: pointers into cb would be read by the caller
+		// after the lock is released.
+		halfOpenRequestCount := cb.halfOpenRequestCount
+		halfOpenSuccessCount := cb.halfOpenSuccessCount
+		halfOpenFailureCount := cb.halfOpenFailureCount
+
+		stats.HalfOpenRequestCount = &halfOpenRequestCount
+		remainingTestRequests := cb.thresholdRequestInHalfOpen - halfOpenRequestCount
 		stats.RemainingTestRequests = &remainingTestRequests
 
 		// New half-open statistics
-		stats.HalfOpenSuccessCount = &cb.halfOpenSuccessCount
-		stats.HalfOpenFailureCount = &cb.halfOpenFailureCount
+		stats.HalfOpenSuccessCount = &halfOpenSuccessCount
+		stats.HalfOpenFailureCount = &halfOpenFailureCount
 
-		totalHalfOpenRequests := cb.halfOpenSuccessCount + cb.halfOpenFailureCount
+		totalHalfOpenRequests := halfOpenSuccessCount + halfOpenFailureCount
 		if totalHalfOpenRequests > 0 {
-			successRate := float64(cb.halfOpenSuccessCount) / float64(totalHalfOpenRequests)
+			successRate := float64(halfOpenSuccessCount) / float64(totalHalfOpenRequests)
 			stats.HalfOpenSuccessRate = &successRate
 		}
 	}
@@ -633,7 +737,9 @@ func (cb *CircuitBreaker) SetCustomErrorPredicate(predicate func(error) bool) {
 	cb.isFailure = predicate
 }
 
-// SetStateChangeListener sets a callback for state changes.
+// SetStateChangeListener sets a callback for state changes. listener must be a
+// func(from, to State); any other value is ignored. The callback runs in its own
+// goroutine for every transition.
 func (cb *CircuitBreaker) SetStateChangeListener(listener any) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
@@ -642,7 +748,8 @@ func (cb *CircuitBreaker) SetStateChangeListener(listener any) {
 	}
 }
 
-// SetRequestCompleteListener sets a callback for request completion.
+// SetRequestCompleteListener sets a callback for request completion. The
+// callback runs in its own goroutine for every completed request.
 func (cb *CircuitBreaker) SetRequestCompleteListener(listener func(success bool, duration time.Duration)) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
