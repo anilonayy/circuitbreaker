@@ -1492,18 +1492,18 @@ func testCircuitBreakerThresholdBasedHalfOpenFailure(t *testing.T) {
 	t.Logf("📊 Circuit opened with 40%% success rate: %s", cb.GetState())
 }
 
-func TestCircuitBreakerCatastrophicFailureProtection(t *testing.T) {
-	runOnVirtualClock(t, testCircuitBreakerCatastrophicFailureProtection)
+func TestCircuitBreakerHalfOpenReopensBelowTargetRate(t *testing.T) {
+	runOnVirtualClock(t, testCircuitBreakerHalfOpenReopensBelowTargetRate)
 }
 
-func testCircuitBreakerCatastrophicFailureProtection(t *testing.T) {
-	t.Logf("🔧 Testing catastrophic failure protection in half-open state")
+func testCircuitBreakerHalfOpenReopensBelowTargetRate(t *testing.T) {
+	t.Logf("🔧 Testing that half-open reopens when the completed probes miss the target success rate")
 
 	openTimeout := 2 * time.Second
 	thresholdRequests := int64(10)
 	targetRate := 0.6
 
-	cb := NewCircuitBreaker("test-catastrophic-protection",
+	cb := NewCircuitBreaker("test-half-open-below-target-rate",
 		options.WithTimeWindow(10*time.Second),
 		options.WithMinimumRequestThreshold(3),
 		options.WithFailureRateThreshold(0.5),
@@ -1542,24 +1542,27 @@ func testCircuitBreakerCatastrophicFailureProtection(t *testing.T) {
 	}
 	t.Logf("📊 Circuit state after half-open: %s", cb.GetState())
 
-	// Step 3: Test catastrophic failure (80% failure rate in first few requests)
-	t.Logf("🔧 Step 3: Testing catastrophic failure protection")
+	// Step 3: Fail the remaining probes of the half-open round
+	t.Logf("🔧 Step 3: Failing the remaining half-open probes")
 
-	// Send 4 failing requests out of 5 total (80% failure rate)
+	// Send 10 failing requests. Together with the success above, the first 9
+	// complete the round of 10 probes at a 10% success rate, below the 60%
+	// target, which reopens the circuit; the 10th is rejected by the open
+	// circuit. The circuit does not reopen before the round is complete.
 	for range 10 {
 		err := cb.Execute(ctx, func(ctx context.Context) error {
-			return errors.New("catastrophic error")
+			return errors.New("probe error")
 		})
 		if err == nil {
 			t.Error("❌ Expected error, got nil")
 		}
 	}
 
-	// Circuit should open immediately due to catastrophic failure protection
+	// Circuit should be open again: the probe round ended below the target rate
 	if cb.GetState() != StateOpen {
-		t.Errorf("❌ Expected state to be OPEN due to catastrophic failure, got %s", cb.GetState())
+		t.Errorf("❌ Expected state to be OPEN after the probe round missed the target rate, got %s", cb.GetState())
 	}
-	t.Logf("📊 Circuit opened early due to catastrophic failure protection: %s", cb.GetState())
+	t.Logf("📊 Circuit reopened after the probe round missed the target rate: %s", cb.GetState())
 }
 
 func TestCircuitBreakerHalfOpenRequestLimit(t *testing.T) {
