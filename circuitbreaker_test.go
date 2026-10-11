@@ -3,12 +3,40 @@ package circuitbreaker
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/anilonayy/circuitbreaker/options"
 	"github.com/stretchr/testify/assert"
 )
+
+// runOnVirtualClock runs test inside a synctest bubble. Tests that wait for the
+// open timeout or the request timeout use it: their time.Sleep calls, timers
+// and context deadlines follow a virtual clock that jumps ahead as soon as
+// every goroutine of the test is blocked, so each wait takes exactly as long as
+// written and costs no real time. Such a test is declared as a TestXxx wrapper
+// that passes its testXxx body to this function.
+//
+// The virtual clock starts over in every bubble, so a breaker must not outlive
+// the bubble it was created in: its timestamps would lie in the next bubble's
+// future. Breakers registered by test are therefore removed when it ends.
+func runOnVirtualClock(t *testing.T, test func(t *testing.T)) {
+	t.Helper()
+
+	existing := ListCircuitBreakers()
+
+	t.Cleanup(func() {
+		for _, key := range ListCircuitBreakers() {
+			if !slices.Contains(existing, key) {
+				RemoveCircuitBreaker(key)
+			}
+		}
+	})
+
+	synctest.Test(t, test)
+}
 
 func TestNewCircuitBreaker(t *testing.T) {
 	t.Logf("🔧 TEST START: Creating new circuit breaker with key 'test-service'")
@@ -164,6 +192,10 @@ func TestCircuitBreakerStates(t *testing.T) {
 }
 
 func TestCircuitBreakerTimeout(t *testing.T) {
+	runOnVirtualClock(t, testCircuitBreakerTimeout)
+}
+
+func testCircuitBreakerTimeout(t *testing.T) {
 	t.Logf("🔧 TEST START: Circuit Breaker Timeout Handling")
 	testStartTime := time.Now()
 
@@ -652,6 +684,10 @@ func TestStateStrings(t *testing.T) {
 }
 
 func TestWithOptions(t *testing.T) {
+	runOnVirtualClock(t, testWithOptions)
+}
+
+func testWithOptions(t *testing.T) {
 	t.Logf("🔧 TEST START: Circuit Breaker Custom Options Configuration")
 	testStartTime := time.Now()
 
@@ -911,6 +947,10 @@ func TestGetDetailedStatisticsReturnsStruct(t *testing.T) {
 }
 
 func TestCircuitBreakerOpenToHalfOpenTransition(t *testing.T) {
+	runOnVirtualClock(t, testCircuitBreakerOpenToHalfOpenTransition)
+}
+
+func testCircuitBreakerOpenToHalfOpenTransition(t *testing.T) {
 	t.Logf("🔧 TEST START: OPEN → HALF_OPEN → CLOSED State Transition")
 	testStartTime := time.Now()
 
@@ -1065,6 +1105,10 @@ func TestCircuitBreakerOpenToHalfOpenTransition(t *testing.T) {
 }
 
 func TestCircuitBreakerHalfOpenToOpenTransition(t *testing.T) {
+	runOnVirtualClock(t, testCircuitBreakerHalfOpenToOpenTransition)
+}
+
+func testCircuitBreakerHalfOpenToOpenTransition(t *testing.T) {
 	t.Logf("🔧 TEST START: HALF_OPEN → OPEN State Transition (Failure Recovery)")
 	testStartTime := time.Now()
 
@@ -1188,6 +1232,10 @@ func TestCircuitBreakerHalfOpenToOpenTransition(t *testing.T) {
 }
 
 func TestCircuitBreakerMixedHalfOpenRequests(t *testing.T) {
+	runOnVirtualClock(t, testCircuitBreakerMixedHalfOpenRequests)
+}
+
+func testCircuitBreakerMixedHalfOpenRequests(t *testing.T) {
 	t.Logf("🔧 Testing mixed success/failure requests in HALF_OPEN state")
 
 	openTimeout := 2 * time.Second
@@ -1280,6 +1328,10 @@ func TestCircuitBreakerMixedHalfOpenRequests(t *testing.T) {
 }
 
 func TestCircuitBreakerThresholdBasedHalfOpen(t *testing.T) {
+	runOnVirtualClock(t, testCircuitBreakerThresholdBasedHalfOpen)
+}
+
+func testCircuitBreakerThresholdBasedHalfOpen(t *testing.T) {
 	t.Logf("🔧 Testing new threshold-based half-open logic")
 
 	openTimeout := 2 * time.Second
@@ -1371,6 +1423,10 @@ func TestCircuitBreakerThresholdBasedHalfOpen(t *testing.T) {
 }
 
 func TestCircuitBreakerThresholdBasedHalfOpenFailure(t *testing.T) {
+	runOnVirtualClock(t, testCircuitBreakerThresholdBasedHalfOpenFailure)
+}
+
+func testCircuitBreakerThresholdBasedHalfOpenFailure(t *testing.T) {
 	t.Logf("🔧 Testing threshold-based half-open logic - failure scenario")
 
 	openTimeout := 2 * time.Second
@@ -1437,6 +1493,10 @@ func TestCircuitBreakerThresholdBasedHalfOpenFailure(t *testing.T) {
 }
 
 func TestCircuitBreakerCatastrophicFailureProtection(t *testing.T) {
+	runOnVirtualClock(t, testCircuitBreakerCatastrophicFailureProtection)
+}
+
+func testCircuitBreakerCatastrophicFailureProtection(t *testing.T) {
 	t.Logf("🔧 Testing catastrophic failure protection in half-open state")
 
 	openTimeout := 2 * time.Second
@@ -1503,6 +1563,10 @@ func TestCircuitBreakerCatastrophicFailureProtection(t *testing.T) {
 }
 
 func TestCircuitBreakerHalfOpenRequestLimit(t *testing.T) {
+	runOnVirtualClock(t, testCircuitBreakerHalfOpenRequestLimit)
+}
+
+func testCircuitBreakerHalfOpenRequestLimit(t *testing.T) {
 	t.Logf("🔧 Testing HALF_OPEN request limit enforcement")
 
 	openTimeout := 2 * time.Second
@@ -1577,6 +1641,10 @@ func TestCircuitBreakerHalfOpenRequestLimit(t *testing.T) {
 }
 
 func TestCircuitBreakerDetailedStateTiming(t *testing.T) {
+	runOnVirtualClock(t, testCircuitBreakerDetailedStateTiming)
+}
+
+func testCircuitBreakerDetailedStateTiming(t *testing.T) {
 	t.Logf("🔧 Testing detailed state timing with precise measurements")
 
 	openTimeout := 3 * time.Second
@@ -1650,6 +1718,10 @@ func TestCircuitBreakerDetailedStateTiming(t *testing.T) {
 }
 
 func TestCircuitBreakerConcurrentHalfOpenRequests(t *testing.T) {
+	runOnVirtualClock(t, testCircuitBreakerConcurrentHalfOpenRequests)
+}
+
+func testCircuitBreakerConcurrentHalfOpenRequests(t *testing.T) {
 	t.Logf("🔧 TEST START: Concurrent Requests in HALF_OPEN State")
 	testStartTime := time.Now()
 
