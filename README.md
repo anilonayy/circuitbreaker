@@ -84,7 +84,7 @@ stateDiagram-v2
 
 - Closed: traffic flows; failures are tracked in a sliding time window.
 - Open: fast‑fail; rejects immediately; waits `openTimeout` before probing.
-- Half‑Open: allows limited test requests; closes if success rate ≥ target, otherwise re‑opens.
+- Half‑Open: lets through at most `ThresholdRequestInHalfOpen` probe requests per round, counting the ones still in flight, and rejects the rest with `ErrCircuitBreakerOpen`. Once all probes have completed it closes if their success rate ≥ target, otherwise re‑opens. A probe that times out counts as a failed probe.
 
 ---
 
@@ -211,14 +211,15 @@ circuitbreaker.RemoveCircuitBreaker("billing")
 
 ## 🚨 Errors
 
-- `ErrCircuitBreakerOpen`: request rejected while circuit is Open (fast‑fail)
+- `ErrCircuitBreakerOpen`: request rejected without being executed (fast‑fail), because the circuit is Open or because it is Half‑Open and all probe slots are taken
 - `ErrCircuitBreakerTimeout`: request exceeded breaker’s per‑request timeout
 
 ---
 
 ## Notes
 
-- Thread‑safe: internal locking protects state and metrics.
+- Thread‑safe: a single internal lock protects state, configuration and metrics; admitting a request and recording its result are each atomic, so concurrent callers see one consistent state machine. The suite passes under `go test -race`.
+- Event hooks run asynchronously, each call in its own goroutine and outside the lock: they may call back into the breaker, and calls for successive events are not ordered.
 - Context‑aware: honors provided `context.Context` and enforces its own timeout.
 - `NewCircuitBreaker(key, ...)` registers the breaker under `key`; calling it again with an existing key returns the already-registered breaker and ignores the new options.
 - `ExecuteWithTimeout` is an alternative to `Execute` that coordinates goroutine completion around the breaker's timeout.
