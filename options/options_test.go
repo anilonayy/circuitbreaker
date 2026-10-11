@@ -229,13 +229,12 @@ func TestPresets(t *testing.T) {
 		want   []call
 	}{
 		{
-			// Not the values NewCircuitBreaker uses without options: the
-			// minimum request threshold here is 100, there it is 10.
+			// The values NewCircuitBreaker uses without options.
 			name:   "WithDefaults",
 			preset: options.WithDefaults(),
 			want: []call{
 				{time.Minute, timeWindow},
-				{int64(100), minRequests},
+				{int64(10), minRequests},
 				{0.5, failureRate},
 				{30 * time.Second, openTimeout},
 				{5 * time.Second, reqTimeout},

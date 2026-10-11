@@ -195,15 +195,12 @@ func WithRequestCompleteListener(listener func(success bool, duration time.Durat
 
 // Convenience functions for common configurations
 
-// WithDefaults returns a general-purpose preset as a base for customization.
-//
-// It is not identical to what a breaker uses when it is given no options at
-// all: this preset sets the minimum request threshold to 100, a breaker without
-// options uses 10. The other values are the same.
+// WithDefaults returns the values a breaker uses when it is given no options
+// at all, as an explicit base for customization.
 func WithDefaults() []Option {
 	return []Option{
 		WithTimeWindow(60 * time.Second),
-		WithMinimumRequestThreshold(100),
+		WithMinimumRequestThreshold(10),
 		WithFailureRateThreshold(0.5),
 		WithOpenTimeout(30 * time.Second),
 		WithRequestTimeout(5 * time.Second),
