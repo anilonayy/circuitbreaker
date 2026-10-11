@@ -775,68 +775,88 @@ func ListCircuitBreakers() []string {
 // not here.
 
 // SetTimeWindow sets the time window for failure analysis. The window is
-// counted in whole seconds.
+// counted in whole seconds. A duration that is not positive is ignored.
 func (cb *CircuitBreaker) SetTimeWindow(duration time.Duration) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	cb.timeWindow = duration
+	if duration > 0 {
+		cb.timeWindow = duration
+	}
 }
 
 // SetMinimumRequestThreshold sets the number of requests the time window must
-// hold before the failure rate can open the breaker.
+// hold before the failure rate can open the breaker. A threshold that is not
+// positive is ignored.
 func (cb *CircuitBreaker) SetMinimumRequestThreshold(threshold int64) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	cb.minimumRequestThreshold = threshold
+	if threshold > 0 {
+		cb.minimumRequestThreshold = threshold
+	}
 }
 
 // SetFailureRateThreshold sets the failure rate, between 0 and 1, at which the
-// closed breaker opens.
+// closed breaker opens. A rate outside that range is ignored.
 func (cb *CircuitBreaker) SetFailureRateThreshold(threshold float64) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	cb.failureRateThreshold = threshold
+	if threshold >= 0 && threshold <= 1 {
+		cb.failureRateThreshold = threshold
+	}
 }
 
 // SetOpenTimeout sets how long the circuit breaker stays open before it lets
-// probes through. It applies to a breaker that is open right now as well.
+// probes through. It applies to a breaker that is open right now as well. A
+// timeout that is not positive is ignored.
 func (cb *CircuitBreaker) SetOpenTimeout(timeout time.Duration) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	cb.openTimeout = timeout
+	if timeout > 0 {
+		cb.openTimeout = timeout
+	}
 }
 
 // SetRequestTimeout sets the maximum duration for individual requests. It
-// applies to requests admitted from now on.
+// applies to requests admitted from now on. A timeout that is not positive is
+// ignored.
 func (cb *CircuitBreaker) SetRequestTimeout(timeout time.Duration) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	cb.requestTimeout = timeout
+	if timeout > 0 {
+		cb.requestTimeout = timeout
+	}
 }
 
 // SetThresholdRequestInHalfOpen sets the number of probe requests admitted and
-// evaluated per half-open round.
+// evaluated per half-open round. A threshold that is not positive is ignored.
 func (cb *CircuitBreaker) SetThresholdRequestInHalfOpen(threshold int64) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	cb.thresholdRequestInHalfOpen = threshold
+	if threshold > 0 {
+		cb.thresholdRequestInHalfOpen = threshold
+	}
 }
 
 // SetTargetRateInHalfOpen sets the share of successful probes, between 0 and 1,
-// required to close the circuit after a half-open round.
+// required to close the circuit after a half-open round. A rate outside that
+// range is ignored.
 func (cb *CircuitBreaker) SetTargetRateInHalfOpen(rate float64) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	cb.targetRateInHalfOpen = rate
+	if rate >= 0 && rate <= 1 {
+		cb.targetRateInHalfOpen = rate
+	}
 }
 
 // SetCustomErrorPredicate sets the function that decides whether an error
 // returned by the wrapped function counts as a failure. It is not asked about
-// nil errors or timeouts. predicate must not be nil.
+// nil errors or timeouts. A nil predicate is ignored.
 func (cb *CircuitBreaker) SetCustomErrorPredicate(predicate func(error) bool) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	cb.isFailure = predicate
+	if predicate != nil {
+		cb.isFailure = predicate
+	}
 }
 
 // SetStateChangeListener sets a callback for state changes. listener must be a
