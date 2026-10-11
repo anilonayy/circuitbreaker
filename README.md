@@ -1,5 +1,6 @@
 # 🚦 Go Circuit Breaker
 
+[![CI](https://github.com/anilonayy/circuitbreaker/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/anilonayy/circuitbreaker/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/anilonayy/circuitbreaker.svg)](https://pkg.go.dev/github.com/anilonayy/circuitbreaker)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -342,6 +343,8 @@ go test -race ./...
 ```
 
 Tests that wait for the open timeout or the request timeout run on a virtual clock (`testing/synctest`), so they take no real time and do not depend on scheduling. Every concurrency and panic-handling bug fixed so far is pinned by a regression test named after it (`go test -race -run Regression -v .`); each of them fails against the code from before the fixes.
+
+CI runs `gofmt`, `go vet` and the race tests, for the library and the examples, on the oldest supported Go (see `go.mod`) and on the current release.
 
 ---
 
