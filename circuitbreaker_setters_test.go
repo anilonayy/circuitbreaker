@@ -2,8 +2,10 @@ package circuitbreaker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -224,4 +226,67 @@ func TestRegressionStateChangeListenerType(t *testing.T) {
 			cb.SetStateChangeListener(listener)
 		})
 	}
+}
+
+// Regression: DetailedStatistics reported durations in whole seconds only, so
+// a 250ms open timeout or a 500ms request timeout showed up as 0. The
+// millisecond fields carry the exact values; the second fields keep their
+// meaning for existing readers.
+func TestRegressionDetailedStatisticsSubSecondDurations(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			openTimeout    = 250 * time.Millisecond
+			requestTimeout = 500 * time.Millisecond
+		)
+
+		cb := newTestBreaker(t,
+			options.WithOpenTimeout(openTimeout),
+			options.WithRequestTimeout(requestTimeout),
+		)
+
+		stats := cb.GetDetailedStatistics()
+		if stats.OpenTimeoutMillis != 250 || stats.RequestTimeoutMillis != 500 {
+			t.Errorf("milliseconds: open timeout %d, request timeout %d; want 250, 500",
+				stats.OpenTimeoutMillis, stats.RequestTimeoutMillis)
+		}
+
+		if stats.OpenTimeoutSeconds != 0 || stats.RequestTimeoutSeconds != 0 {
+			t.Errorf("whole seconds: open timeout %d, request timeout %d; want 0, 0",
+				stats.OpenTimeoutSeconds, stats.RequestTimeoutSeconds)
+		}
+
+		if stats.TimeUntilHalfOpenMillis != nil {
+			t.Errorf("TimeUntilHalfOpenMillis = %d on a closed breaker, want nil", *stats.TimeUntilHalfOpenMillis)
+		}
+
+		_ = cb.Execute(context.Background(), fail)
+
+		if got := cb.GetState(); got != StateOpen {
+			t.Fatalf("state: got %v, want %v", got, StateOpen)
+		}
+
+		time.Sleep(100 * time.Millisecond)
+
+		stats = cb.GetDetailedStatistics()
+		if stats.TimeUntilHalfOpenMillis == nil || *stats.TimeUntilHalfOpenMillis != 150 {
+			t.Errorf("TimeUntilHalfOpenMillis = %v, want 150", deref(stats.TimeUntilHalfOpenMillis))
+		}
+
+		raw, err := json.Marshal(stats)
+		if err != nil {
+			t.Fatalf("json.Marshal: %v", err)
+		}
+
+		for _, want := range []string{`"open_timeout_ms":250`, `"request_timeout_ms":500`, `"time_until_half_open_ms":150`} {
+			if !strings.Contains(string(raw), want) {
+				t.Errorf("JSON %s does not contain %s", raw, want)
+			}
+		}
+
+		time.Sleep(200 * time.Millisecond)
+
+		if stats = cb.GetDetailedStatistics(); stats.TimeUntilHalfOpenMillis != nil {
+			t.Errorf("TimeUntilHalfOpenMillis = %d after the open timeout, want nil", *stats.TimeUntilHalfOpenMillis)
+		}
+	})
 }

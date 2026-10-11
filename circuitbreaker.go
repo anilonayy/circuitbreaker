@@ -80,9 +80,13 @@ type DetailedStatistics struct {
 	// round, in flight or completed.
 	HalfOpenRequestCount *int64 `json:"half_open_request_count,omitempty"`
 	// TimeUntilHalfOpenSeconds is the time left until the open timeout has
-	// passed. It is nil once it has: the breaker then turns half-open with the
-	// next request.
+	// passed, in whole seconds, rounded down. It is nil once it has: the
+	// breaker then turns half-open with the next request.
 	TimeUntilHalfOpenSeconds *int64 `json:"time_until_half_open_seconds,omitempty"`
+	// TimeUntilHalfOpenMillis is the same time in milliseconds, for timeouts
+	// that whole seconds cannot express. It is nil when
+	// TimeUntilHalfOpenSeconds is.
+	TimeUntilHalfOpenMillis *int64 `json:"time_until_half_open_ms,omitempty"`
 	// NextHalfOpenAt is OpenedAt plus the open timeout, in RFC 3339 format.
 	NextHalfOpenAt *string `json:"next_half_open_at,omitempty"`
 	// State is the state's name as returned by State.String.
@@ -95,10 +99,16 @@ type DetailedStatistics struct {
 	ThresholdRequestInHalfOpen int64 `json:"threshold_request_in_half_open"`
 	// TargetRateInHalfOpen is the share of successful probes needed to close.
 	TargetRateInHalfOpen float64 `json:"target_rate_in_half_open"`
-	// RequestTimeoutSeconds is the request timeout.
+	// RequestTimeoutSeconds is the request timeout in whole seconds, rounded
+	// down: 0 for a timeout below one second.
 	RequestTimeoutSeconds int64 `json:"request_timeout_seconds"`
-	// OpenTimeoutSeconds is how long the breaker stays open.
+	// RequestTimeoutMillis is the request timeout in milliseconds.
+	RequestTimeoutMillis int64 `json:"request_timeout_ms"`
+	// OpenTimeoutSeconds is how long the breaker stays open, in whole seconds,
+	// rounded down: 0 for a timeout below one second.
 	OpenTimeoutSeconds int64 `json:"open_timeout_seconds"`
+	// OpenTimeoutMillis is how long the breaker stays open, in milliseconds.
+	OpenTimeoutMillis int64 `json:"open_timeout_ms"`
 	// FailureRateThreshold is the failure rate at which the breaker opens.
 	FailureRateThreshold float64 `json:"failure_rate_threshold"`
 	// MinimumRequestThreshold is the number of requests the window must hold
@@ -513,11 +523,10 @@ func (cb *CircuitBreaker) recordRequest(success bool) {
 // updateStateAfterRequest counts a completed probe of the current half-open
 // round and, once thresholdRequestInHalfOpen probes have completed, closes or
 // reopens the breaker depending on their success rate. mu must be held.
+//
+// The caller passes only probes whose generation matches the breaker's. Every
+// transition starts a new generation, so the breaker is still half-open here.
 func (cb *CircuitBreaker) updateStateAfterRequest(success bool) {
-	if cb.state != StateHalfOpen {
-		return
-	}
-
 	if success {
 		cb.halfOpenSuccessCount++
 	} else {
@@ -687,7 +696,9 @@ func (cb *CircuitBreaker) GetDetailedStatistics() DetailedStatistics {
 		MinimumRequestThreshold:    cb.minimumRequestThreshold,
 		FailureRateThreshold:       cb.failureRateThreshold,
 		OpenTimeoutSeconds:         int64(cb.openTimeout.Seconds()),
+		OpenTimeoutMillis:          cb.openTimeout.Milliseconds(),
 		RequestTimeoutSeconds:      int64(cb.requestTimeout.Seconds()),
+		RequestTimeoutMillis:       cb.requestTimeout.Milliseconds(),
 		ThresholdRequestInHalfOpen: cb.thresholdRequestInHalfOpen,
 		TargetRateInHalfOpen:       cb.targetRateInHalfOpen,
 	}
@@ -704,6 +715,8 @@ func (cb *CircuitBreaker) GetDetailedStatistics() DetailedStatistics {
 		if timeUntilHalfOpen > 0 {
 			timeUntilHalfOpenSeconds := int64(timeUntilHalfOpen.Seconds())
 			stats.TimeUntilHalfOpenSeconds = &timeUntilHalfOpenSeconds
+			timeUntilHalfOpenMillis := timeUntilHalfOpen.Milliseconds()
+			stats.TimeUntilHalfOpenMillis = &timeUntilHalfOpenMillis
 		} else {
 			stats.TimeUntilHalfOpenSeconds = nil
 		}
