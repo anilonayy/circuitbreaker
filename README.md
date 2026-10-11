@@ -122,7 +122,7 @@ Import `github.com/anilonayy/circuitbreaker/options` and compose any of the opti
 | `WithStateChangeListener(any)` | none | Callback for every state transition. Must be exactly a `func(from, to circuitbreaker.State)`. |
 | `WithRequestCompleteListener(func(success bool, d time.Duration))` | none | Callback for every admitted request with its outcome and duration. |
 
-Options are applied in order, so a later one overrides an earlier one. An option with an out‑of‑range value (a duration or count that is not positive, a rate outside 0–1, a `nil` predicate) is silently skipped and the previous value stays; no error is reported. `WithStateChangeListener` likewise ignores a value of any other type, including `nil`.
+Options are applied in order, so a later one overrides an earlier one. An option with an out‑of‑range value (a duration or count that is not positive, a rate outside 0–1, a `nil` predicate) is silently skipped and the previous value stays; no error is reported. `WithStateChangeListener` likewise ignores a value of any other type, including `nil`. The `Set*` methods on a breaker follow the same rule: an out‑of‑range value leaves the setting as it was.
 
 Mind the two ends of the rate options: `WithFailureRateThreshold(0)` opens the breaker as soon as the minimum number of requests is reached, failures or not, and `WithTargetRateInHalfOpen(0)` closes it after the probes whatever their outcome.
 
@@ -132,7 +132,7 @@ Each preset returns a `[]options.Option` you can append overrides to. A dash mea
 
 | Preset | Window | Min. requests | Failure rate | Open timeout | Request timeout | Probes | Target rate |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `WithDefaults()` | 1m | 100 | 0.5 | 30s | 5s | 10 | 0.6 |
+| `WithDefaults()` | 1m | 10 | 0.5 | 30s | 5s | 10 | 0.6 |
 | `WithTestDefaults()` | 1m | 5 | 0.5 | 30s | 3s | 10 | 0.6 |
 | `WithAggressive()` | 30s | 5 | 0.3 | 2m | 3s | 5 | 0.8 |
 | `WithConservative()` | 2m | 20 | 0.7 | 15s | 10s | 15 | 0.5 |
@@ -140,7 +140,7 @@ Each preset returns a `[]options.Option` you can append overrides to. A dash mea
 | `WithDatabaseDefaults()` | 2m | 15 | 0.6 | 45s | 15s | – | – |
 | `WithMicroserviceDefaults()` | 1m | 8 | 0.4 | 20s | 8s | – | – |
 
-Note that `WithDefaults()` is not the same as passing no options: it sets the minimum request threshold to 100, where a breaker without options uses 10.
+`WithDefaults()` spells out the values a breaker uses when it is given no options.
 
 ### Builder
 
